@@ -409,6 +409,12 @@ log "  secrets: ${SECRETS_FILE}（DB パスワード等。画面には表示し�
 #                         firewalld, fail2ban, docker, app_deploy
 #   ★この時点では ssh_hardening は root 無効化を行わない設計（後述の確認待ち後に適用）。
 # ============================================================
+# Ansible collections を導入（requirements.yml: ansible.posix の firewalld・community.docker 等）
+if [[ -f "${INFRA_DIR}/ansible/requirements.yml" ]]; then
+  log "Ansible collections を導入します（requirements.yml）。"
+  ansible-galaxy collection install -r "${INFRA_DIR}/ansible/requirements.yml"
+fi
+
 log "Ansible playbook を local connection で実行します（OS 設定〜コンテナ起動）。"
 ansible-playbook \
   -i "${INFRA_DIR}/ansible/inventory/localhost.yml" \
