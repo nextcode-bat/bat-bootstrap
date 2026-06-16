@@ -405,7 +405,7 @@ log "  secrets: ${SECRETS_FILE}（DB パスワード等。画面には表示し�
 
 # ============================================================
 # Ansible 実行（手順書 §6 手順9〜 / 付録A の role 群を local connection で適用）
-#   site.yml の roles 順: common, users, ssh_hardening, totp,
+#   site.yml の roles 順: common, swap, users, ssh_hardening, totp,
 #                         firewalld, fail2ban, docker, app_deploy
 #   ★この時点では ssh_hardening は root 無効化を行わない設計（後述の確認待ち後に適用）。
 # ============================================================
