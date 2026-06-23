@@ -391,6 +391,27 @@ done
   || warn "貼り付けられた公開鍵が ssh-/ecdsa-/sk- で始まっていません。形式を確認してください。"
 
 # ============================================================
+# 11. バックアップ設定（#665 backup role 向け）
+#     GCS バケット名と保持日数を対話で収集する。
+#     ★ GCS SA キー JSON 本体はここでは取り扱わない（鍵漏洩リスク軽減）。
+#     構築後に手動で /etc/bat/gcs-sa-key.json へ配置すること（roles/backup/README.md §3 参照）。
+# ============================================================
+cat > /dev/tty <<'BKUPMSG'
+
+---- バックアップ設定（#665 backup role） ----
+GCS バケットへの binlog 転送設定を行います。
+★ GCS SA キー JSON は構築後に手動で /etc/bat/gcs-sa-key.json へ配置してください。
+  （キー漏洩リスクのため bootstrap.sh では取り扱いません: roles/backup/README.md §3）
+BKUPMSG
+GCS_BUCKET="$(ask "バックアップ先 GCS バケット名（例: bat-backup-binlog）" "")"
+if [[ -z "$GCS_BUCKET" ]]; then
+  warn "GCS バケット名が未設定です。bat:backup:binlog-ship は BAT_BINLOG_GCS_BUCKET 未設定でスキップされます。"
+  warn "後から .env.production に BAT_BINLOG_GCS_BUCKET を追記してください（docs/runbook-backup-restore.md §2）。"
+fi
+BACKUP_RETENTION_DAYS="$(ask "バックアップ保持日数" "8")"
+BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-8}"
+
+# ============================================================
 # 収集値の書き出し（機密は infra 配下の生成 config に限定し、権限 600）
 #   - vars ファイル: Ansible へ非機密パラメータを渡す（YAML）
 #   - secrets env  : 機密（DB パスワード等）を 600 で保存。app_deploy role が .env 生成に使用。
@@ -455,6 +476,9 @@ staging_mode: "${_staging_mode}"
 staging_host: "${STAGING_HOST}"
 # 機密 env ファイルの場所（app_deploy role が読み込んで .env を生成）
 secrets_env_path: "${SECRETS_FILE}"
+# バックアップ設定（#665 backup role）
+gcs_bucket: "${GCS_BUCKET}"
+backup_retention_days: ${BACKUP_RETENTION_DAYS}
 VARS
 
 # --- 機密 env（KEY=VALUE）。app_deploy role が .env 生成に使用 ---
