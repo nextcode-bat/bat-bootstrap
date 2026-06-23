@@ -14,11 +14,20 @@ OS 設定・SSH 二段階認証（公開鍵＋TOTP）・Docker・BunkerWeb(WAF) 
 root で SSH 接続後、以下を実行する。
 
 ```bash
-# 1) bootstrap.sh を取得
+# 1) OS を最新化してから再起動
+#    ※ カーネル更新を確実に反映させるため、bootstrap.sh 取得前に必ず実施する
+dnf -y update
+reboot
+```
+
+再起動後、再度 root で SSH 接続し直してから続行する。
+
+```bash
+# 2) bootstrap.sh を取得
 #    ※ "curl ... | bash" は対話入力(read)が壊れるため、必ず保存してから実行する
 curl -fsSL https://raw.githubusercontent.com/nextcode-bat/bat-bootstrap/main/bootstrap.sh -o bootstrap.sh
 
-# 2) 実行
+# 3) 実行
 sudo bash bootstrap.sh
 ```
 
