@@ -53,6 +53,12 @@ ask() {
     printf '%s: ' "$prompt" > /dev/tty
   fi
   IFS= read -r reply < /dev/tty || true
+  # 末尾 CR (Windows 改行 / 一部 SSH クライアントでの混入) を除去。
+  # CR が残ると URL 末尾に \r が紛れ、to_ssh_url で「空リポ名」エラーを引き起こす。
+  reply="${reply%$'\r'}"
+  # 前後の空白 (タブ・空白) を除去。URL ペースト時の余白を吸収。
+  reply="${reply#"${reply%%[![:space:]]*}"}"
+  reply="${reply%"${reply##*[![:space:]]}"}"
   printf '%s' "${reply:-$default}"
 }
 
@@ -62,6 +68,10 @@ ask_secret() {
   printf '%s: ' "$prompt" > /dev/tty
   IFS= read -rs reply < /dev/tty || true
   printf '\n' > /dev/tty
+  # 末尾 CR と前後空白を除去（ask と同じ理由・トークンの末尾汚染防止）。
+  reply="${reply%$'\r'}"
+  reply="${reply#"${reply%%[![:space:]]*}"}"
+  reply="${reply%"${reply##*[![:space:]]}"}"
   printf '%s' "$reply"
 }
 
@@ -164,12 +174,22 @@ readonly DEPLOY_KEY="/root/.ssh/bat_deploy_key"
 # REPO_URL を SSH 形式（git@github.com:owner/repo.git）へ正規化
 to_ssh_url() {
   local u="$1"
+  # 二重防御: ask 側で除去済だが、念のため末尾 CR / スラッシュも除去する。
+  u="${u%$'\r'}"
+  u="${u%/}"
   case "$u" in
-    git@*) printf '%s' "$u" ;;
+    git@*)
+      # git@github.com:owner/repo or git@github.com:owner/repo.git → 末尾 .git を一旦剥がして付け直す
+      local path_part="${u#git@github.com:}"
+      path_part="${path_part%.git}"
+      path_part="${path_part%/}"
+      printf 'git@github.com:%s.git' "$path_part"
+      ;;
     https://github.com/*)
-      # https://github.com/owner/repo(.git) → git@github.com:owner/repo.git
+      # https://github.com/owner/repo(.git)(/) → git@github.com:owner/repo.git
       local path="${u#https://github.com/}"
       path="${path%.git}"
+      path="${path%/}"
       printf 'git@github.com:%s.git' "$path"
       ;;
     *) printf '%s' "$u" ;;
@@ -179,12 +199,15 @@ to_ssh_url() {
 # REPO_URL を https://<PAT>@github.com/owner/repo.git へ変換
 to_https_pat_url() {
   local u="$1" pat="$2" path=""
+  u="${u%$'\r'}"
+  u="${u%/}"
   case "$u" in
     https://github.com/*) path="${u#https://github.com/}" ;;
     git@github.com:*)     path="${u#git@github.com:}" ;;
     *) die "PAT 認証では https/ssh の GitHub URL を指定してください: ${u}" ;;
   esac
   path="${path%.git}"
+  path="${path%/}"
   printf 'https://%s@github.com/%s.git' "$pat" "$path"
 }
 
