@@ -34,6 +34,23 @@ sudo bash bootstrap.sh
 対話で順に質問される（続行確認／リポURL／clone認証／配置先／環境／ドメイン／メール・DBパス／SSHユーザー・公開鍵）。
 完了すると BunkerWeb 経由で HTTPS アクセスできる状態になる。
 
+```bash
+# 4) 初回ユーザー（管理者）を作成
+#    /register ルートは存在しない設計のため、初回ユーザーは必ず本コマンドで作成する。
+#    対話で email / username / パスワードを入力する。
+#      - username: 3〜64文字・英数字・ハイフン・アンダースコア
+#      - password: 12文字以上・英大文字・英小文字・数字・記号を各1文字以上
+#                  （BAT_セキュリティ要件 認証-02 準拠）
+#    既にユーザーが1件でも存在する場合は失敗する（1人運用ガード）。
+#    なお、migrate および db:seed は Ansible app_deploy ロールで自動実行済みのため、
+#    ここでは追加の手動投入は不要。
+cd /opt/bat-app   # bootstrap.sh の対話で別パスを指定した場合はそちらへ
+sudo docker compose exec app php artisan bat:create-user
+```
+
+作成直後は 2FA 未設定（`totp_enabled_at = null`）。
+ブラウザで `https://<SERVER_NAME>/login` にユーザー名・パスワードでログインすると、`EnsureTwoFactorEnabled` ミドルウェアにより `/2fa/setup` へ自動誘導され、TOTP 登録とリカバリコード発行を行う。
+
 ## 構成上の位置づけ
 
 ```
