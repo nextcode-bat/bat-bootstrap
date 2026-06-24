@@ -8,7 +8,7 @@
 #   2. private リポ（bat-app の fork）の clone（Deploy key / PAT）
 #   3. 対話で収集したパラメータを Ansible へ渡す vars / .env へ書き出し
 #   4. ansible-playbook を local connection で実行し OS を本番設定
-#   5. ★安全装置: deploy + TOTP ログイン成功を別端末で確認するまで停止し、
+#   5. ★安全装置: work + TOTP ログイン成功を別端末で確認するまで停止し、
 #      確認後に root SSH を無効化する（ロックアウト防止・手順書 §7.3）
 #
 # 取得・実行方法（手順書 §5.1）:
@@ -385,15 +385,15 @@ fi
 DB_ROOT_PASSWORD="$(gen_password)"
 
 # ============================================================
-# 10. SSH: deploy ユーザー名 / 公開鍵（手順書 §6 手順10 / §7.1 / 付録B）
+# 10. SSH: work ユーザー名 / 公開鍵（手順書 §6 手順10 / §7.1 / 付録B）
 #     公開鍵は複数行（END で終了）または 1 行貼り付けに対応。
 # ============================================================
-DEPLOY_USER="$(ask "deploy ユーザー名" "deploy")"
-[[ -n "$DEPLOY_USER" ]] || DEPLOY_USER="deploy"
+WORK_USER="$(ask "work ユーザー名" "work")"
+[[ -n "$WORK_USER" ]] || WORK_USER="work"
 
 cat > /dev/tty <<'PUBKEYMSG'
 
-deploy ユーザーの authorized_keys に登録する【公開鍵】を貼り付けてください（手順書 §7.1）。
+work ユーザーの authorized_keys に登録する【公開鍵】を貼り付けてください（手順書 §7.1）。
   - 1 行（ssh-ed25519 ... のような行）をそのまま貼り付け、Enter。
   - 複数行・複数鍵を登録する場合は行を貼り付け、最後に END だけの行を入力。
 PUBKEYMSG
@@ -401,7 +401,7 @@ SSH_PUBKEYS=""
 first_line=""
 IFS= read -r first_line < /dev/tty || true
 if [[ "$first_line" == "END" ]]; then
-  die "公開鍵が入力されませんでした。deploy ユーザーへのログインに必須です。"
+  die "公開鍵が入力されませんでした。work ユーザーへのログインに必須です。"
 fi
 SSH_PUBKEYS="$first_line"
 # 追加行があれば END まで読み続ける（複数鍵対応）
@@ -481,11 +481,11 @@ cat > "$VARS_FILE" <<VARS
 deploy_env: "${DEPLOY_ENV}"
 server_name: "${SERVER_NAME}"
 le_email: "${LE_EMAIL}"
-deploy_user: "${DEPLOY_USER}"
+work_user: "${WORK_USER}"
 app_dir: "${APP_DIR}"
 infra_dir: "${INFRA_DIR}"
-# deploy ユーザーへ登録する公開鍵（authorized_keys, perm 600）
-deploy_ssh_authorized_keys: |
+# work ユーザーへ登録する公開鍵（authorized_keys, perm 600）
+work_ssh_authorized_keys: |
 $(printf '%s\n' "$SSH_PUBKEYS" | sed 's/^/  /')
 # TLS モード（手順書 §8.1 / #599 Phase B cert モード判定）。app_deploy role が compose env へ反映。
 use_letsencrypt: "${_use_letsencrypt}"
@@ -546,8 +546,8 @@ ok "Ansible によるサーバー設定が完了しました。"
 #   【設計メモ】実際の PermitRootLogin no の適用は ssh_hardening role が担当する。
 #   bootstrap.sh はここで停止し、確認後に「disable_root_ssh=true」を渡して
 #   ssh_hardening role（の root 無効化タスク）のみ再適用する。
-#   この二段構え（先に deploy+TOTP を整備 → 疎通確認 → 後から root 無効化）により、
-#   deploy 側設定に不備があってもサーバーへ入れなくなる事故を防ぐ。
+#   この二段構え（先に work+TOTP を整備 → 疎通確認 → 後から root 無効化）により、
+#   work 側設定に不備があってもサーバーへ入れなくなる事故を防ぐ。
 # ============================================================
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 cat > /dev/tty <<CONFIRM
@@ -555,19 +555,19 @@ cat > /dev/tty <<CONFIRM
 ============================================================
 ${C_WARN}★重要・ロックアウト防止の確認（手順書 §7.3）${C_RESET}
 
-deploy ユーザーと TOTP による 2 要素ログインが成功することを
+work ユーザーと TOTP による 2 要素ログインが成功することを
 【別の端末】で必ず確認してください。確認できるまで root 無効化はしません。
 
   別端末で実行:
-    ssh ${DEPLOY_USER}@${SERVER_IP:-<このサーバーの固定IP>}
+    ssh ${WORK_USER}@${SERVER_IP:-<このサーバーの固定IP>}
     → 「秘密鍵（公開鍵認証）＋ TOTP 6 桁コード」でログインできること
 
-  ※ 初回 TOTP 登録（QR スキャン）が未実施の場合は、先に deploy で
+  ※ 初回 TOTP 登録（QR スキャン）が未実施の場合は、先に work で
      'google-authenticator' を実行し QR を登録してください（手順書 §7.2.2）。
 ============================================================
 CONFIRM
 
-if ask_yes_no "別端末で deploy + TOTP のログイン成功を確認しましたか？（root SSH を無効化します）"; then
+if ask_yes_no "別端末で work + TOTP のログイン成功を確認しましたか？（root SSH を無効化します）"; then
   log "root SSH を無効化します（ssh_hardening role を disable_root_ssh=true で再適用）。"
   ansible-playbook \
     -i "${INFRA_DIR}/ansible/inventory/localhost.yml" \
@@ -578,7 +578,7 @@ if ask_yes_no "別端末で deploy + TOTP のログイン成功を確認しま�
     --tags ssh_hardening
   ok "root SSH ログインを無効化しました（PermitRootLogin no）。"
 else
-  warn "root SSH は無効化していません。deploy ログイン確認後に、以下を再実行してください:"
+  warn "root SSH は無効化していません。work ログイン確認後に、以下を再実行してください:"
   cat > /dev/tty <<RETRY
     ansible-playbook -i ${INFRA_DIR}/ansible/inventory/localhost.yml \\
       ${INFRA_DIR}/ansible/site.yml -c local \\
@@ -623,7 +623,7 @@ cat > /dev/tty <<'DONE'
   構築フロー完了。次の確認を行ってください（手順書 §10）:
    1) https://<SERVER_NAME>/ へアクセスし証明書と WAF 応答を確認
    2) /healthz が HTTP 200 を返すこと
-   3) ssh deploy@<IP> が 2 要素で成功し、root SSH は拒否されること
+   3) ssh work@<IP> が 2 要素で成功し、root SSH は拒否されること
 ============================================================
 DONE
 ok "bootstrap.sh を終了します。"

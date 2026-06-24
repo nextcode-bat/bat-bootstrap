@@ -58,7 +58,7 @@ curl で bootstrap.sh を取得 → 実行
   → private な bat-app fork を clone（既定 /opt/bat-app）
   → /opt/bat-app/infra/ansible で ansible-playbook（OS設定・SSH/TOTP・Docker）
   → docker compose up（BunkerWeb + アプリ一式）
-  → 別端末で deploy+TOTP ログイン確認 → root SSH 無効化
+  → 別端末で work+TOTP ログイン確認 → root SSH 無効化
 ```
 
 - **bootstrap.sh**：本リポジトリ（公開・curl 配布）。`INFRA_DIR="${APP_DIR}/infra"` のとおり、置き場所に依存せず clone 先の Ansible を参照する。
