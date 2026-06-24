@@ -244,6 +244,25 @@ DKMSG
       ssh-keyscan -t ed25519 github.com >> /root/.ssh/known_hosts 2>/dev/null || true
       chmod 600 /root/.ssh/known_hosts 2>/dev/null || true
 
+      # /root/.ssh/config に github.com の IdentityFile を永続記録する。
+      # GIT_SSH_COMMAND は本スクリプト実行中だけ有効な環境変数なので、bootstrap.sh
+      # 終了後に運用者が改めて `git pull` する際に Permission denied になる事故が
+      # 起きる。/root/.ssh/config に Host github.com の IdentityFile を書いておけば、
+      # 以降は root で素の `git pull` が通る。
+      # 冪等: 既に同マーカーのブロックがあれば置換、無ければ追記。
+      if ! grep -q "^# BEGIN BAT root github.com config" /root/.ssh/config 2>/dev/null; then
+        cat >> /root/.ssh/config <<SSHCONF
+# BEGIN BAT root github.com config (managed by bootstrap.sh)
+Host github.com
+  IdentityFile ${DEPLOY_KEY}
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+# END BAT root github.com config (managed by bootstrap.sh)
+SSHCONF
+        chmod 600 /root/.ssh/config
+        ok "/root/.ssh/config に github.com の IdentityFile を記録しました（後続の root git pull が通るようにするため）。"
+      fi
+
       # この鍵を使う git 用 SSH コマンド。CLONE_URL は SSH 形式へ正規化する。
       export GIT_SSH_COMMAND="ssh -i ${DEPLOY_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
       CLONE_URL="$(to_ssh_url "$REPO_URL")"
