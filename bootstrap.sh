@@ -99,12 +99,21 @@ if [[ -r /etc/os-release ]]; then
   fi
 fi
 
-cat > /dev/tty <<'BANNER'
+cat > /dev/tty <<BANNER
 
 ============================================================
   BAT サーバー構築 bootstrap.sh
   対話に答えるだけで OS 設定〜コンテナ起動まで自動構築します。
   （詳細: BAT_サーバー構築手順書 §6 対話フロー）
+
+${C_WARN}★本スクリプトは構築完了時に root SSH を自動的に無効化します（手順書 §7.3）。${C_RESET}
+  ロックアウト防止のため、実行前に以下を別端末で必ず確認してください:
+    1. work ユーザーで公開鍵 SSH ログインができること
+    2. work ユーザーで 'google-authenticator' を実行し TOTP 登録済みであること
+    3. work ユーザーで「鍵＋TOTP 6桁」の 2 要素ログインが成功すること
+  ※ 初回構築時は work ユーザーがまだ存在しません。その場合は本スクリプト
+     完走後、root が無効化される直前に work が自動作成されるため、
+     構築完了後の最初のログインまでに上記 1〜3 を必ず済ませてください。
 ============================================================
 
 BANNER
@@ -112,7 +121,7 @@ BANNER
 # ------------------------------------------------------------
 # 1. 続行確認 [y/N]（手順書 §6 手順1）
 # ------------------------------------------------------------
-ask_yes_no "このサーバーに対して本番構築を開始してよろしいですか？" \
+ask_yes_no "このサーバーに対して本番構築を開始してよろしいですか？（root SSH は完走時に自動で無効化されます）" \
   || die "中止しました。"
 
 # ============================================================
@@ -559,52 +568,48 @@ ansible-playbook \
 ok "Ansible によるサーバー設定が完了しました。"
 
 # ============================================================
-# ★安全装置: root SSH 無効化はロックアウト防止のため確認後に実施（手順書 §6 手順10 / §7.3）
-#   ここで一旦停止し、運用者に別端末での 2 要素ログイン成功を確認してもらう。
+# root SSH 無効化（手順書 §6 手順10 / §7.3）
 #
-#   【設計メモ】実際の PermitRootLogin no の適用は ssh_hardening role が担当する。
-#   bootstrap.sh はここで停止し、確認後に「disable_root_ssh=true」を渡して
-#   ssh_hardening role（の root 無効化タスク）のみ再適用する。
-#   この二段構え（先に work+TOTP を整備 → 疎通確認 → 後から root 無効化）により、
-#   work 側設定に不備があってもサーバーへ入れなくなる事故を防ぐ。
+#   起動時の冒頭バナーで「完走時に root SSH を自動無効化する」旨を予告し、
+#   続行確認（ask_yes_no）の Yes をもってロックアウトの了承とみなす設計。
+#   ここでは確認対話を挟まず、ssh_hardening role を disable_root_ssh=true で
+#   再適用して PermitRootLogin no を反映する（冪等）。
+#
+#   【設計メモ】2-pass フロー（1回目 disable=false / 2回目 disable=true）は
+#   ssh_hardening role 内の when ガードに依存しており、role 自体は冪等のため
+#   再適用しても sshd reload 以外の副作用はない。
+#   work + TOTP の事前準備が未完で本処理が走った場合、root 無効化後に
+#   work でログインできない事故が起きうるため、冒頭バナーの 1〜3 を必ず
+#   完了させてから bootstrap.sh を実行すること。
 # ============================================================
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-cat > /dev/tty <<CONFIRM
+cat > /dev/tty <<NOTICE
 
 ============================================================
-${C_WARN}★重要・ロックアウト防止の確認（手順書 §7.3）${C_RESET}
+${C_WARN}★ root SSH を自動的に無効化します（手順書 §7.3）${C_RESET}
 
-work ユーザーと TOTP による 2 要素ログインが成功することを
-【別の端末】で必ず確認してください。確認できるまで root 無効化はしません。
+work ユーザー（${WORK_USER}）+ TOTP の 2 要素ログインが
+別端末で成功する状態であることを前提に処理を進めます。
 
-  別端末で実行:
+  別端末での確認コマンド:
     ssh ${WORK_USER}@${SERVER_IP:-<このサーバーの固定IP>}
     → 「秘密鍵（公開鍵認証）＋ TOTP 6 桁コード」でログインできること
 
-  ※ 初回 TOTP 登録（QR スキャン）が未実施の場合は、先に work で
-     'google-authenticator' を実行し QR を登録してください（手順書 §7.2.2）。
+  ※ 構築直後で TOTP 未登録の場合は、root が無効化される前に
+     work で 'google-authenticator' を実行して QR を登録してください
+     （手順書 §7.2.2）。
 ============================================================
-CONFIRM
+NOTICE
 
-if ask_yes_no "別端末で work + TOTP のログイン成功を確認しましたか？（root SSH を無効化します）"; then
-  log "root SSH を無効化します（ssh_hardening role を disable_root_ssh=true で再適用）。"
-  ansible-playbook \
-    -i "${INFRA_DIR}/ansible/inventory/localhost.yml" \
-    "${INFRA_DIR}/ansible/site.yml" \
-    -c local \
-    --extra-vars "@${VARS_FILE}" \
-    --extra-vars "disable_root_ssh=true" \
-    --tags ssh_hardening
-  ok "root SSH ログインを無効化しました（PermitRootLogin no）。"
-else
-  warn "root SSH は無効化していません。work ログイン確認後に、以下を再実行してください:"
-  cat > /dev/tty <<RETRY
-    ansible-playbook -i ${INFRA_DIR}/ansible/inventory/localhost.yml \\
-      ${INFRA_DIR}/ansible/site.yml -c local \\
-      --extra-vars "@${VARS_FILE}" \\
-      --extra-vars "disable_root_ssh=true" --tags ssh_hardening
-RETRY
-fi
+log "root SSH を無効化します（ssh_hardening role を disable_root_ssh=true で再適用）。"
+ansible-playbook \
+  -i "${INFRA_DIR}/ansible/inventory/localhost.yml" \
+  "${INFRA_DIR}/ansible/site.yml" \
+  -c local \
+  --extra-vars "@${VARS_FILE}" \
+  --extra-vars "disable_root_ssh=true" \
+  --tags ssh_hardening
+ok "root SSH ログインを無効化しました（PermitRootLogin no）。"
 
 # ============================================================
 # 機密ファイル cleanup（任意・推奨）
