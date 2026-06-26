@@ -295,10 +295,10 @@ SSHCONF
 prepare_clone_auth
 
 # ============================================================
-# 5. 配置先ディレクトリ（手順書 §6 手順5 / 付録B: 既定 /opt/bat-app）
+# 5. 配置先ディレクトリ（固定 /opt/bat-app）
+#    所有者方針により対話入力を撤廃し固定値化（commit ...追従 / v1.8）。
 # ============================================================
-APP_DIR="$(ask "アプリの配置先ディレクトリ" "/opt/bat-app")"
-[[ -n "$APP_DIR" ]] || APP_DIR="/opt/bat-app"
+readonly APP_DIR="/opt/bat-app"
 
 # ============================================================
 # 6. git clone 実行（手順書 §6 手順6 / §11.1 冪等: 既存なら git pull）
@@ -413,11 +413,11 @@ fi
 DB_ROOT_PASSWORD="$(gen_password)"
 
 # ============================================================
-# 10. SSH: work ユーザー名 / 公開鍵（手順書 §6 手順10 / §7.1 / 付録B）
+# 10. SSH: work 公開鍵（手順書 §6 手順10 / §7.1 / 付録B）
+#     work ユーザー名は固定 `work`（所有者方針 / v1.8）。
 #     公開鍵は複数行（END で終了）または 1 行貼り付けに対応。
 # ============================================================
-WORK_USER="$(ask "work ユーザー名" "work")"
-[[ -n "$WORK_USER" ]] || WORK_USER="work"
+readonly WORK_USER="work"
 
 cat > /dev/tty <<'PUBKEYMSG'
 
@@ -440,6 +440,34 @@ while IFS= read -r line < /dev/tty; do
 done
 [[ "$SSH_PUBKEYS" == ssh-* || "$SSH_PUBKEYS" == ecdsa-* || "$SSH_PUBKEYS" == sk-* ]] \
   || warn "貼り付けられた公開鍵が ssh-/ecdsa-/sk- で始まっていません。形式を確認してください。"
+
+# ============================================================
+# 10b. deploy-bot 用 SSH 鍵自動生成（CD 専用ユーザー / v1.8）
+#
+#   deploy-bot は GitHub Actions（deploy-production.yml）から SSH で本番に
+#   入って `make deploy-current` を実行する CD 専用ユーザー。
+#   本スクリプトが ed25519 鍵を /root/.ssh/bat_cd_key に自動生成し、
+#   公開鍵を bootstrap_vars.yml に書き出して ansible roles/users が
+#   deploy-bot の authorized_keys に登録する。
+#   秘密鍵は完走後にコンソール表示して、運用者が GitHub Secrets
+#   PROD_SSH_KEY に登録できるようにする。
+#
+#   冪等性: 既に /root/.ssh/bat_cd_key が存在すれば再生成しない。
+# ============================================================
+readonly DEPLOY_BOT_KEY="/root/.ssh/bat_cd_key"
+
+if [[ ! -f "$DEPLOY_BOT_KEY" ]]; then
+  log "deploy-bot 用 SSH 鍵ペアを生成します（ed25519・無パスフレーズ）。"
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  ssh-keygen -t ed25519 -N "" -C "bat-cd-deploy-bot" -f "$DEPLOY_BOT_KEY" >/dev/null
+  chmod 600 "$DEPLOY_BOT_KEY"
+  chmod 644 "${DEPLOY_BOT_KEY}.pub"
+  ok "deploy-bot 用 SSH 鍵を生成しました: $DEPLOY_BOT_KEY"
+else
+  log "deploy-bot 用 SSH 鍵は既に存在します: $DEPLOY_BOT_KEY（再生成しません）"
+fi
+
+DEPLOY_BOT_PUBKEY="$(cat "${DEPLOY_BOT_KEY}.pub")"
 
 # ============================================================
 # 11. バックアップ設定（#665 backup role 向け）
@@ -515,6 +543,9 @@ infra_dir: "${INFRA_DIR}"
 # work ユーザーへ登録する公開鍵（authorized_keys, perm 600）
 work_ssh_authorized_keys: |
 $(printf '%s\n' "$SSH_PUBKEYS" | sed 's/^/  /')
+# deploy-bot 用（CD 専用ユーザー・GitHub Actions から SSH で入る / v1.8）
+deploy_bot_user: "deploy-bot"
+deploy_bot_ssh_authorized_keys: "${DEPLOY_BOT_PUBKEY}"
 # TLS モード（手順書 §8.1 / #599 Phase B cert モード判定）。app_deploy role が compose env へ反映。
 use_letsencrypt: "${_use_letsencrypt}"
 generate_self_signed: "${_generate_self_signed}"
@@ -641,6 +672,40 @@ else
   warn "機密ファイルを残置しました。VPS のセキュリティに留意してください: ${SECRETS_FILE}"
 fi
 
+# ============================================================
+# 完走通知: deploy-bot 秘密鍵を GitHub Secrets PROD_SSH_KEY に登録（v1.8）
+#   GitHub Actions (deploy-production.yml) が deploy-bot として SSH ログインし、
+#   make deploy-current を実行する。秘密鍵は本サーバー上 (/root/.ssh/bat_cd_key)
+#   にも残置されるが、CD 経路は GitHub Secrets 経由が正本。
+# ============================================================
+SERVER_PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+cat > /dev/tty <<DEPLOYKEYMSG
+
+============================================================
+${C_WARN}★ GitHub Secrets PROD_SSH_KEY 登録用の秘密鍵${C_RESET}
+
+以下の秘密鍵を GitHub の Secrets に登録してください
+（GitHub Actions deploy-production.yml が deploy-bot として
+ 本番にログインするのに使用します）:
+
+  登録 URL : https://github.com/nextcode-bat/bat-app/settings/secrets/actions
+  Secret 名: PROD_SSH_KEY
+  値       : 下の -----BEGIN OPENSSH PRIVATE KEY----- から
+             -----END OPENSSH PRIVATE KEY----- までの全行を貼り付け
+
+----- 秘密鍵（コピー用）-----
+$(cat "$DEPLOY_BOT_KEY")
+----- 秘密鍵ここまで -----
+
+PROD_HOST と PROD_USER も合わせて登録してください:
+  PROD_HOST: ${SERVER_PRIMARY_IP:-<このサーバーの固定IP>}
+  PROD_USER: deploy-bot
+
+秘密鍵ファイルはサーバー上に ${DEPLOY_BOT_KEY} として保存されています
+（権限 0600・root 読み取り専用）。
+============================================================
+DEPLOYKEYMSG
+
 cat > /dev/tty <<'DONE'
 
 ============================================================
@@ -648,6 +713,8 @@ cat > /dev/tty <<'DONE'
    1) https://<SERVER_NAME>/ へアクセスし証明書と WAF 応答を確認
    2) /healthz が HTTP 200 を返すこと
    3) ssh work@<IP> が 2 要素で成功し、root SSH は拒否されること
+   4) GitHub Secrets に PROD_SSH_KEY / PROD_HOST / PROD_USER を登録
+      （deploy-production.yml が deploy-bot として SSH ログインする）
 ============================================================
 DONE
 ok "bootstrap.sh を終了します。"
