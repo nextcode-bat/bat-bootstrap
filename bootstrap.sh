@@ -167,17 +167,26 @@ REPO_URL="$(ask "bat-app の fork（private リポジトリ）の URL を入力�
 
 # ============================================================
 # 4. clone 認証方式の選択（手順書 §6 手順4 / §9）
-#    1) Deploy key（推奨・read-only）  2) Fine-grained PAT
+#    1) Deploy key（推奨・write 許可運用）  2) Fine-grained PAT
 # ============================================================
 cat > /dev/tty <<'AUTHMENU'
 
 clone の認証方式を選択してください（手順書 §9）:
-  1) Deploy key（推奨・read-only・リポジトリ単位・失効容易）
+  1) Deploy key（推奨・write 許可・リポジトリ単位・失効容易）
   2) Fine-grained PAT（1 ステップだがトークン管理が必要）
 AUTHMENU
 AUTH_METHOD="$(ask "番号を入力" "1")"
 
-# Deploy key 用に生成する鍵のパス（deploy 専用・read-only 想定）
+# Deploy key 用に生成する鍵のパス（deploy + 開発者 push 兼用・write 許可運用 / 2026-06-26 運用変更）。
+#
+# ★セキュリティ注意（write 許可運用のトレードオフ）:
+#   - 本鍵を保持するサーバー / ユーザーが侵害された場合、攻撃者が main へ
+#     直接 push できる攻撃面が生じる（read-only 運用には無かったリスク）。
+#   - CD 経路の侵害シナリオを許容しない構成にする場合は、本鍵を read-only に
+#     戻し、CD 用には別途 write 許可の deploy key（または fine-grained PAT）を
+#     分離する設計に切り替えることを推奨。
+#   - 本スクリプトの想定は「開発者と CI が同一の write 許可 deploy key を
+#     共有する小規模運用」（2026-06-26 運用方針）。
 readonly DEPLOY_KEY="/root/.ssh/bat_deploy_key"
 
 # REPO_URL を SSH 形式（git@github.com:owner/repo.git）へ正規化
@@ -240,7 +249,7 @@ prepare_clone_auth() {
 ------------------------------------------------------------
 以下の【公開鍵】を GitHub の対象リポジトリに登録してください。
   GitHub ▸ 対象リポジトリ ▸ Settings ▸ Deploy keys ▸ Add deploy key
-  （Allow write access はチェック不要。read-only で構いません。手順書 §9.1）
+  ★Allow write access にチェックを入れて登録してください（運用変更 2026-06-26・手順書 §9.1）
 ------------------------------------------------------------
 DKMSG
       cat "${DEPLOY_KEY}.pub" > /dev/tty
