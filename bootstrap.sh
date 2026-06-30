@@ -189,6 +189,117 @@ AUTH_METHOD="$(ask "番号を入力" "1")"
 #     共有する小規模運用」（2026-06-26 運用方針）。
 readonly DEPLOY_KEY="/root/.ssh/bat_deploy_key"
 
+# ------------------------------------------------------------
+# GitHub SSH ホスト鍵の固定検証（#1109 / セキュリティ要件 SSH 接続）
+#
+# 旧実装は StrictHostKeyChecking=accept-new による TOFU（初回接続時に
+# 表示された鍵を信用する方式）だったが、初回接続が MITM 経路だった場合に
+# 偽の鍵を known_hosts に焼き付けてしまうリスクが残る。
+#
+# 本ブロックは GitHub 公式が公開している SHA256 指紋値をスクリプト内に
+# 埋め込み、ssh-keyscan の結果と一致比較してから既知ホストとして固定する
+# 「鍵ピンニング方式」へ切り替える。一致しなければスクリプトを即時 abort
+# し、運用者へ MITM の可能性を通知する。
+#
+# 出典: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+# 値の取得日: 2026-07-01（再検証は ssh-keygen -lf でローカル一致確認済み）
+# 鍵ローテーション時は本定数を更新し、サーバー構築手順書のセキュリティ
+# 節も追従改訂すること（CLAUDE.md「BAT_セキュリティ要件」参照）。
+# ------------------------------------------------------------
+readonly GITHUB_HOST_FP_ED25519="SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
+readonly GITHUB_HOST_FP_ECDSA="SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM"
+readonly GITHUB_HOST_FP_RSA="SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s"
+
+# verify_and_pin_github_host_key
+#   ssh-keyscan で github.com のホスト鍵を取得し、上記公式指紋と一致する
+#   ことを検証してから known_hosts に固定追記する（accept-new を撤廃）。
+#
+#   引数:
+#     $1 = 追記先 known_hosts のパス
+#          （既定: /etc/ssh/ssh_known_hosts。システムワイドに置くことで
+#           bootstrap.sh 完走後に Ansible が作成する work ユーザーも追加
+#           設定なく同じ既知鍵を継承する。所有者方針: root:root / 0644）
+#
+#   冪等性:
+#     既に対象ファイルに ^github.com の行があれば skip し、再書き込みしない。
+#
+#   失敗時の挙動:
+#     - ssh-keyscan が 3 回連続で失敗 → die（ネットワーク不通の可能性）
+#     - 取得した鍵の SHA256 指紋が埋め込み値と不一致 → die（MITM 検知）
+verify_and_pin_github_host_key() {
+  local target="${1:-/etc/ssh/ssh_known_hosts}"
+  local target_dir
+  target_dir="$(dirname "$target")"
+
+  mkdir -p "$target_dir"
+
+  # 既に github.com が登録済みなら skip（冪等性・手順書 §11.1）
+  if [[ -f "$target" ]] && grep -q '^github\.com ' "$target" 2>/dev/null; then
+    ok "github.com のホスト鍵は既に ${target} に固定済み（skip）。"
+    return 0
+  fi
+
+  # ssh-keyscan を最大 3 回リトライ（ネットワーク一時不通対策）
+  local scanned="" attempt=0
+  while (( attempt < 3 )); do
+    attempt=$((attempt + 1))
+    log "github.com のホスト鍵を取得します（ssh-keyscan / 試行 ${attempt}/3）。"
+    if scanned="$(ssh-keyscan -T 10 -t ed25519,ecdsa,rsa github.com 2>/dev/null)" \
+        && [[ -n "$scanned" ]]; then
+      break
+    fi
+    warn "ssh-keyscan に失敗しました（試行 ${attempt}/3）。"
+    scanned=""
+    sleep 2
+  done
+  [[ -n "$scanned" ]] \
+    || die "github.com のホスト鍵を取得できませんでした（DNS / ファイアウォール / 上流ネットワークを確認してください）。"
+
+  # 取得した各行を SHA256 指紋に変換し、埋め込み値と一致するか検証
+  local verified=0
+  local line fp_line fp algo
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    fp_line="$(printf '%s\n' "$line" | ssh-keygen -lf - 2>/dev/null || true)"
+    [[ -z "$fp_line" ]] && continue
+    # 形式例: "256 SHA256:xxxxx... github.com (ED25519)"
+    fp="$(awk '{print $2}' <<< "$fp_line")"
+    algo="$(awk '{print $NF}' <<< "$fp_line" | tr -d '()')"
+    case "$algo" in
+      ED25519)
+        [[ "$fp" == "$GITHUB_HOST_FP_ED25519" ]] \
+          || die "github.com ED25519 鍵指紋が GitHub 公式値と不一致（MITM の可能性）: 取得=${fp} / 期待=${GITHUB_HOST_FP_ED25519}"
+        ok "github.com ED25519 指紋一致を確認: ${fp}"
+        verified=$((verified + 1))
+        ;;
+      ECDSA)
+        [[ "$fp" == "$GITHUB_HOST_FP_ECDSA" ]] \
+          || die "github.com ECDSA 鍵指紋が GitHub 公式値と不一致（MITM の可能性）: 取得=${fp} / 期待=${GITHUB_HOST_FP_ECDSA}"
+        ok "github.com ECDSA 指紋一致を確認: ${fp}"
+        verified=$((verified + 1))
+        ;;
+      RSA)
+        [[ "$fp" == "$GITHUB_HOST_FP_RSA" ]] \
+          || die "github.com RSA 鍵指紋が GitHub 公式値と不一致（MITM の可能性）: 取得=${fp} / 期待=${GITHUB_HOST_FP_RSA}"
+        ok "github.com RSA 指紋一致を確認: ${fp}"
+        verified=$((verified + 1))
+        ;;
+      *)
+        warn "未知の鍵種別を検出したため検証対象外（スキップ）: algo=${algo}"
+        ;;
+    esac
+  done <<< "$scanned"
+
+  # 1 件も検証成功しなかった場合は安全側に倒して abort（鍵欠落 / 解析失敗）
+  (( verified > 0 )) \
+    || die "github.com のホスト鍵検証が 0 件成功でした。ssh-keyscan / ssh-keygen の出力解析に失敗している可能性があります。"
+
+  # 検証 OK: known_hosts に固定追記（追記方式: 既存の他ホストエントリを破壊しない）
+  printf '%s\n' "$scanned" >> "$target"
+  chmod 644 "$target"
+  ok "github.com のホスト鍵 ${verified} 件を ${target} に固定しました（鍵ピンニング完了）。"
+}
+
 # REPO_URL を SSH 形式（git@github.com:owner/repo.git）へ正規化
 to_ssh_url() {
   local u="$1"
@@ -258,9 +369,12 @@ DKMSG
       printf 'Deploy key を登録したら Enter を押してください... ' > /dev/tty
       IFS= read -r _ < /dev/tty || true
 
-      # github.com のホスト鍵を known_hosts へ追加（対話プロンプトを避ける）
-      ssh-keyscan -t ed25519 github.com >> /root/.ssh/known_hosts 2>/dev/null || true
-      chmod 600 /root/.ssh/known_hosts 2>/dev/null || true
+      # github.com のホスト鍵を /etc/ssh/ssh_known_hosts へ「固定」する
+      # （#1109）。旧実装の accept-new による TOFU は撤廃し、GitHub 公式の
+      # SHA256 指紋とのプレ検証を経た上でシステムワイドに鍵をピンニングする。
+      # システムワイドに置くことで、bootstrap.sh 完走後に Ansible が作成する
+      # work ユーザーも追加設定なく同じ既知鍵を継承する（手順書 §9 / §7.1）。
+      verify_and_pin_github_host_key "/etc/ssh/ssh_known_hosts"
 
       # /root/.ssh/config に github.com の IdentityFile を永続記録する。
       # GIT_SSH_COMMAND は本スクリプト実行中だけ有効な環境変数なので、bootstrap.sh
@@ -274,7 +388,9 @@ DKMSG
 Host github.com
   IdentityFile ${DEPLOY_KEY}
   IdentitiesOnly yes
-  StrictHostKeyChecking accept-new
+  # #1109: accept-new(TOFU) を撤廃し、verify_and_pin_github_host_key で
+  # 事前固定した /etc/ssh/ssh_known_hosts のエントリを厳格検証する。
+  StrictHostKeyChecking yes
 # END BAT root github.com config (managed by bootstrap.sh)
 SSHCONF
         chmod 600 /root/.ssh/config
@@ -282,7 +398,9 @@ SSHCONF
       fi
 
       # この鍵を使う git 用 SSH コマンド。CLONE_URL は SSH 形式へ正規化する。
-      export GIT_SSH_COMMAND="ssh -i ${DEPLOY_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+      # #1109: accept-new(TOFU) を撤廃し、verify_and_pin_github_host_key で
+      # 固定済みの /etc/ssh/ssh_known_hosts に対する厳格検証へ切り替え。
+      export GIT_SSH_COMMAND="ssh -i ${DEPLOY_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
       CLONE_URL="$(to_ssh_url "$REPO_URL")"
       ;;
     2)
