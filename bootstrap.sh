@@ -420,6 +420,9 @@ if [[ -z "$DB_PASSWORD" ]]; then
 fi
 # DB root パスワードも併せて自動生成（compose の MYSQL_ROOT_PASSWORD 用）
 DB_ROOT_PASSWORD="$(gen_password)"
+# Redis パスワードを自動生成（docker-compose.production.yml の requirepass 必須・#1062 保護-06）
+# 値は対話表示せず secrets.env → .env.production へ ansible 経由で注入される。
+REDIS_PASSWORD="$(gen_password)"
 
 # ============================================================
 # 10. SSH: work 公開鍵（手順書 §6 手順10 / §7.1 / 付録B）
@@ -477,6 +480,57 @@ else
 fi
 
 DEPLOY_BOT_PUBKEY="$(cat "${DEPLOY_BOT_KEY}.pub")"
+
+# ============================================================
+# 10c. deploy-bot 用 read-only GitHub Deploy key の生成（G7-R-07）
+#
+#   方針:
+#     - CD（deploy-bot）は git fetch / checkout しか行わない（push しない）ため、
+#       deploy-bot が github.com へ接続する際に使う Deploy key は read-only で
+#       十分要件を満たす。
+#     - 一方、人間運用者（work / root）が github.com へ push する経路では
+#       既存の write 許可 Deploy key（/root/.ssh/bat_deploy_key）を継続使用する。
+#     - 鍵を分離することで「deploy-bot 侵害時に main へ直接 push されるリスク」
+#       を遮断する（G7-R-07）。
+#
+#   生成物:
+#     /root/.ssh/bat_cd_deploy_key       … deploy-bot 用 read-only 秘密鍵
+#     /root/.ssh/bat_cd_deploy_key.pub   … 公開鍵（GitHub に Deploy key として
+#                                           **read-only** で登録する）
+#
+#   GitHub 側設定（手順書 §9.1 read-only 追補）:
+#     Settings ▸ Deploy keys ▸ Add deploy key
+#       ★ Allow write access のチェックは外す（read-only）
+#
+#   冪等性: 既に /root/.ssh/bat_cd_deploy_key が存在すれば再生成しない。
+# ============================================================
+readonly DEPLOY_BOT_RO_KEY="/root/.ssh/bat_cd_deploy_key"
+
+if [[ ! -f "$DEPLOY_BOT_RO_KEY" ]]; then
+  log "deploy-bot 用 read-only Deploy key を生成します（ed25519・無パスフレーズ）。"
+  ssh-keygen -t ed25519 -N "" -C "bat-cd-deploy-key-ro" -f "$DEPLOY_BOT_RO_KEY" >/dev/null
+  chmod 600 "$DEPLOY_BOT_RO_KEY"
+  chmod 644 "${DEPLOY_BOT_RO_KEY}.pub"
+  ok "deploy-bot 用 read-only Deploy key を生成しました: $DEPLOY_BOT_RO_KEY"
+  cat > /dev/tty <<RODKMSG
+
+------------------------------------------------------------
+${C_WARN}★ deploy-bot 用 read-only Deploy key の登録（G7-R-07）${C_RESET}
+
+以下の【公開鍵】を GitHub の対象リポジトリに **read-only** で登録してください。
+  GitHub ▸ 対象リポジトリ ▸ Settings ▸ Deploy keys ▸ Add deploy key
+  ★ Allow write access のチェックは入れないこと（read-only 必須）
+
+公開鍵（コピー用・bat-cd-deploy-key-ro）:
+$(cat "${DEPLOY_BOT_RO_KEY}.pub")
+
+登録後、Enter を押すと続行します...
+------------------------------------------------------------
+RODKMSG
+  IFS= read -r _ < /dev/tty || true
+else
+  log "deploy-bot 用 read-only Deploy key は既に存在します: $DEPLOY_BOT_RO_KEY（再生成しません）"
+fi
 
 # ============================================================
 # 11. バックアップ設定（#665 backup role 向け）
@@ -578,10 +632,11 @@ cat > "$SECRETS_FILE" <<SECRETS
 # app_deploy role がこれを基に ${APP_DIR}/.env を生成する想定（手順書 付録A app_deploy）。
 DB_PASSWORD=${DB_PASSWORD}
 DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+REDIS_PASSWORD=${REDIS_PASSWORD}
 SECRETS
 chmod 600 "$VARS_FILE" "$SECRETS_FILE"
 # 機密値はメモリ上からも破棄
-unset DB_PASSWORD DB_ROOT_PASSWORD
+unset DB_PASSWORD DB_ROOT_PASSWORD REDIS_PASSWORD
 ok "対話値を書き出しました（機密は 600 で保護）:"
 log "  vars   : ${VARS_FILE}"
 log "  secrets: ${SECRETS_FILE}（DB パスワード等。画面には表示しません）"
@@ -622,7 +677,9 @@ ok "Ansible によるサーバー設定が完了しました。"
 #   work でログインできない事故が起きうるため、冒頭バナーの 1〜3 を必ず
 #   完了させてから bootstrap.sh を実行すること。
 # ============================================================
-SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+# G7-R-12: hostname -I の重複実行を変数化（NIC 順序変化による結果差異リスク回避）。
+# 本変数はこの後の NOTICE 表示と完走時の SERVER_PRIMARY_IP 表示の両方で再利用する。
+readonly SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 cat > /dev/tty <<NOTICE
 
 ============================================================
@@ -687,7 +744,10 @@ fi
 #   make deploy-current を実行する。秘密鍵は本サーバー上 (/root/.ssh/bat_cd_key)
 #   にも残置されるが、CD 経路は GitHub Secrets 経由が正本。
 # ============================================================
-SERVER_PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+# G7-R-12: hostname -I の二度目実行を避け、§10 で取得した SERVER_IP を流用する。
+# 同一スクリプト実行中に NIC 順序が変わるケースは想定しないが、変数化により
+# 完走通知と root 無効化通知で同一値を返すことを保証する。
+SERVER_PRIMARY_IP="${SERVER_IP}"
 cat > /dev/tty <<DEPLOYKEYMSG
 
 ============================================================
