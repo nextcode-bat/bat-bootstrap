@@ -827,6 +827,118 @@ ansible-playbook \
 ok "root SSH ログインを無効化しました（PermitRootLogin no）。"
 
 # ============================================================
+# TOTP 完全必須化（第 3 パス・任意 / #1110）
+#
+#   目的: PAM から nullok を除去し、~/.google_authenticator を持たないユーザーを
+#         ログイン不可にする（TOTP を「未登録でも通せる状態」から「完全必須」へ格上げ）。
+#
+#   ロックアウトリスク:
+#     - work ユーザーが TOTP 未登録のまま本パスが走ると、公開鍵単独ログインが
+#       不可になり、次回ログイン時にロックアウトする。
+#     - deploy-bot（CD 用）は Match User publickey の例外ブロックが必要
+#       （ssh_hardening §7a / users §9c が管理）。
+#
+#   セーフガード（3 段構え）:
+#     1. work の ~/.google_authenticator の存在確認（未登録なら本パス全体を skip）
+#     2. 1 段目の対話 [y/N]（既定 No で skip）
+#     3. 2 段目の対話 [y/N]「別端末での 2 要素ログイン成功を確認済か？」（既定 No で skip）
+#
+#   選択肢を skip した場合は、後から手動で以下を実行して適用可能（手順書 §7.7）:
+#     cd /opt/bat-app/infra/ansible
+#     ansible-playbook -i inventory/localhost.yml site.yml -c local \
+#       --extra-vars "@/opt/bat-app/infra/.generated/bootstrap_vars.yml" \
+#       --extra-vars "disable_root_ssh=true totp_enforce=true" \
+#       --tags totp,ssh_hardening
+# ============================================================
+
+# work ユーザーが TOTP 登録済みか（~/.google_authenticator の存在で判定）。
+# 存在すれば 0（true）、無ければ 1（false）を返す。bootstrap.sh は root 実行のため
+# 直接 test -f で判定可能（work ユーザーの su は不要）。
+ssh_check_totp_registered() {
+  local ga_path="/home/${WORK_USER}/.google_authenticator"
+  if [[ -f "$ga_path" ]]; then
+    ok "TOTP 登録を検出: ${ga_path}"
+    return 0
+  fi
+  warn "TOTP 登録形跡なし: ${ga_path} が存在しません。"
+  return 1
+}
+
+# 第 3 パス（TOTP 完全必須化）を対話ガード付きで適用する。
+# ★対話は Enter / N で必ず「skip（安全側）」に倒れる。yes を明示入力しない限り実行しない。
+# ★2 段構えの対話に加えて、TOTP 未登録なら対話に入る前に skip する。
+apply_totp_enforce_pass3() {
+  cat > /dev/tty <<PASS3INTRO
+
+============================================================
+${C_WARN}★ TOTP 完全必須化（nullok 除去）の適用ステップに進みます（#1110）${C_RESET}
+
+本ステップは PAM の pam_google_authenticator から nullok を除去し、
+work ユーザーの TOTP 6 桁コード入力を完全必須化します。
+
+  実施前に必ず別端末で以下を目視確認してください:
+    - work ユーザーで '公開鍵 + TOTP 6 桁' の 2 要素ログインが成功すること
+
+  未確認のまま「はい」を選択すると、次回ログイン時に work がロックアウト
+  する危険があります（サーバー再構築が必要になります）。
+
+  skip した場合でも、後から手動で適用可能です（手順書 §7.7）:
+    cd /opt/bat-app/infra/ansible
+    ansible-playbook -i inventory/localhost.yml site.yml -c local \\
+      --extra-vars "@/opt/bat-app/infra/.generated/bootstrap_vars.yml" \\
+      --extra-vars "disable_root_ssh=true totp_enforce=true" \\
+      --tags totp,ssh_hardening
+============================================================
+PASS3INTRO
+
+  # ------------------------------------------------------------
+  # ガード 1: work ユーザーの TOTP 登録有無
+  # ------------------------------------------------------------
+  if ! ssh_check_totp_registered; then
+    warn "work ユーザー (${WORK_USER}) の TOTP が未登録のため、本パスは skip します。"
+    warn "手順: work で 'google-authenticator' を実行して QR 登録した後、"
+    warn "  別端末で 2 要素ログイン成功を確認してから、上記の手動コマンドで再適用してください（手順書 §7.7）。"
+    return 0
+  fi
+
+  # ------------------------------------------------------------
+  # ガード 2: 1 段目の対話（既定 No）
+  # ------------------------------------------------------------
+  if ! ask_yes_no "TOTP 完全必須化（nullok 除去 + deploy-bot 例外ブロック追加）を適用しますか？"; then
+    log "TOTP 完全必須化を skip しました（1 段目の対話でキャンセル）。手動での再適用が可能です（手順書 §7.7）。"
+    return 0
+  fi
+
+  # ------------------------------------------------------------
+  # ガード 3: 2 段目の対話（既定 No・最終確認）
+  # ------------------------------------------------------------
+  if ! ask_yes_no "本当に適用してよいですか？別端末で work + TOTP の 2 要素ログイン成功を確認済ですか？"; then
+    log "TOTP 完全必須化を skip しました（2 段目の対話でキャンセル）。手動での再適用が可能です（手順書 §7.7）。"
+    return 0
+  fi
+
+  # ------------------------------------------------------------
+  # 第 3 パス実行（totp + ssh_hardening を totp_enforce=true / disable_root_ssh=true で再適用）
+  # ------------------------------------------------------------
+  log "Ansible 第 3 パスを totp_enforce=true / disable_root_ssh=true で実行します（--tags totp,ssh_hardening）。"
+  if ansible-playbook \
+      -i "${INFRA_DIR}/ansible/inventory/localhost.yml" \
+      "${INFRA_DIR}/ansible/site.yml" \
+      -c local \
+      --extra-vars "@${VARS_FILE}" \
+      --extra-vars "disable_root_ssh=true totp_enforce=true" \
+      --tags "totp,ssh_hardening"; then
+    ok "TOTP 完全必須化を適用しました（PAM nullok 除去 + deploy-bot 例外ブロック追加）。"
+  else
+    err "TOTP 完全必須化の適用に失敗しました。sshd の状態と /etc/pam.d/sshd を手動で確認してください。"
+    err "  復旧: 手動で /etc/pam.d/sshd の pam_google_authenticator.so 行末に 'nullok' を戻すと元の状態に復帰します。"
+    return 1
+  fi
+}
+
+apply_totp_enforce_pass3
+
+# ============================================================
 # 機密ファイル cleanup（任意・推奨）
 #   secrets.env は DB_PASSWORD / DB_ROOT_PASSWORD を平文で保持する 600 ファイル。
 #   構築完了後はもう不要のため、ここで対話で削除可否を確認する。
