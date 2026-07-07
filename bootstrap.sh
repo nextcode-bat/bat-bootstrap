@@ -340,10 +340,47 @@ to_https_pat_url() {
   printf 'https://%s@github.com/%s.git' "$pat" "$path"
 }
 
+# remote.origin.url から資格情報（userinfo 部）を除去する（#1192）。
+#   PAT 経路の clone は https://<PAT>@github.com/... を .git/config の
+#   remote.origin.url に書き込むため、そのままでは PAT が .git/config
+#   （0644・全ユーザー可読）に永続残置される。clone / pull 完了直後に
+#   本関数で資格情報なしの素の https URL へ書き戻す。
+#   Deploy key 経路の URL（git@github.com:...）は https://*@* に一致しない
+#   ため no-op。過去の実行で埋め込まれた資格情報も本関数で掃除される。
+scrub_origin_credentials() {
+  local dir="$1" current="" cleaned=""
+  current="$(git -C "$dir" remote get-url origin 2>/dev/null)" || return 0
+  case "$current" in
+    https://*@*)
+      # userinfo（<PAT>@ / user:pass@）を最長一致（最終 @ まで）で除去した
+      # URL に組み替える。userinfo 内に @ を含む異常系でも資格情報を確実に
+      # 全除去する側へ倒す（GitHub の owner/repo 名に @ は使えないため、
+      # ホスト名以降を誤って切り詰める実害はない・review-1192 軽微-1）。
+      cleaned="https://${current##*@}"
+      git -C "$dir" remote set-url origin "$cleaned" \
+        || { warn "remote.origin.url の資格情報除去に失敗しました。手動で実行してください: git -C ${dir} remote set-url origin ${cleaned}"; return 0; }
+      ok "remote.origin.url から資格情報を除去しました（PAT の .git/config 残置防止・#1192）: ${cleaned}"
+      ;;
+  esac
+  return 0
+}
+
 prepare_clone_auth() {
   # 認証方式に応じて clone 用の git 環境を整える。
   # - Deploy key: ssh-keygen で鍵生成 → 公開鍵を表示 → GitHub 登録待ち → GIT_SSH_COMMAND を設定
   # - PAT       : 非エコーで読み、認証付き URL を組み立てる（履歴・画面に残さない）
+
+  # github.com のホスト鍵を /etc/ssh/ssh_known_hosts へ「固定」する（#1109）。
+  # 旧実装の accept-new による TOFU は撤廃し、GitHub 公式の SHA256 指紋との
+  # プレ検証を経た上でシステムワイドに鍵をピンニングする。システムワイドに
+  # 置くことで、bootstrap.sh 完走後に Ansible が作成する work ユーザーも追加
+  # 設定なく同じ既知鍵を継承する（手順書 §9 / §7.1）。
+  # #1192（review-1189 A-3）: 旧実装は本呼出が Deploy key 分岐内のみにあり、
+  # PAT(https) 構築経路では known_hosts が未固定のまま完走していた。PAT 経路
+  # でも完走後に work ユーザーが ssh fetch へ移行する可能性があるため、
+  # 認証方式に依らず分岐前で共通実行する（検証ロジック自体は #1109 のまま）。
+  verify_and_pin_github_host_key "/etc/ssh/ssh_known_hosts"
+
   case "$AUTH_METHOD" in
     1)
       mkdir -p /root/.ssh && chmod 700 /root/.ssh
@@ -369,12 +406,8 @@ DKMSG
       printf 'Deploy key を登録したら Enter を押してください... ' > /dev/tty
       IFS= read -r _ < /dev/tty || true
 
-      # github.com のホスト鍵を /etc/ssh/ssh_known_hosts へ「固定」する
-      # （#1109）。旧実装の accept-new による TOFU は撤廃し、GitHub 公式の
-      # SHA256 指紋とのプレ検証を経た上でシステムワイドに鍵をピンニングする。
-      # システムワイドに置くことで、bootstrap.sh 完走後に Ansible が作成する
-      # work ユーザーも追加設定なく同じ既知鍵を継承する（手順書 §9 / §7.1）。
-      verify_and_pin_github_host_key "/etc/ssh/ssh_known_hosts"
+      # github.com のホスト鍵ピンは prepare_clone_auth 冒頭（分岐前）で
+      # 共通実行済み（#1109 / #1192）。
 
       # /root/.ssh/config に github.com の IdentityFile を永続記録する。
       # GIT_SSH_COMMAND は本スクリプト実行中だけ有効な環境変数なので、bootstrap.sh
@@ -432,8 +465,18 @@ readonly APP_DIR="/opt/bat-app"
 # ============================================================
 if [[ -d "${APP_DIR}/.git" ]]; then
   log "既存リポジトリを検出しました。git pull で更新します（冪等）: ${APP_DIR}"
+  # 今回の対話で選択した認証方式を pull に反映する（review-1192 重要-1）。
+  # scrub 済みの素 https remote のままでは (a) Deploy key を選択しても pull に
+  # 使われず (b) PAT を再入力しても pull に乗らず、git 生の credential
+  # プロンプトが割り込む。set-url で CLONE_URL（Deploy key=ssh 形式 /
+  # PAT=認証付き https）へ付け替えてから pull し、PAT の埋め込みは直後の
+  # scrub_origin_credentials で除去する。
+  # ※ 再実行時に REPO_URL へ別リポジトリの URL を入力した場合、remote は
+  #    そのリポへ付け替わる（bootstrap.sh は対話で受けた URL を正とする仕様）。
+  git -C "$APP_DIR" remote set-url origin "$CLONE_URL" \
+    || warn "remote origin の付け替えに失敗しました。既存 remote のまま pull を試行します。"
   git -C "$APP_DIR" pull --ff-only \
-    || warn "git pull に失敗しました（ローカル変更やブランチ差異の可能性）。既存コードのまま続行します。"
+    || warn "git pull に失敗しました（認証・ローカル変更・ブランチ差異の可能性）。既存コードのまま続行します。"
   ok "リポジトリを更新しました。"
 else
   log "リポジトリを clone します: ${APP_DIR}"
@@ -442,6 +485,11 @@ else
     || die "clone に失敗しました。URL・認証（Deploy key / PAT）の登録内容を確認してください。"
   ok "clone が完了しました。"
 fi
+# PAT 経路では clone / pull の完了直後に remote URL から資格情報を除去する（#1192）。
+# 旧実装は unset CLONE_URL のみで、.git/config に https://<PAT>@github.com/...
+# が永続残置されていた。clone / pull 自体は PAT 付き URL で実行してよく、
+# 掃除はその後に行う（過去の実行で残った資格情報もここで除去される）。
+scrub_origin_credentials "$APP_DIR"
 # 認証付き URL（PAT 等）はここで破棄し、以降のログ・ファイルに残さない。
 unset CLONE_URL
 
@@ -651,25 +699,13 @@ else
 fi
 
 # ============================================================
-# 11. バックアップ設定（#665 backup role 向け）
-#     GCS バケット名と保持日数を対話で収集する。
-#     ★ GCS SA キー JSON 本体はここでは取り扱わない（鍵漏洩リスク軽減）。
-#     構築後に手動で /etc/bat/gcs-sa-key.json へ配置すること（roles/backup/README.md §3 参照）。
+# （旧 11. バックアップ設定は撤去済み・todo #1188）
+#   旧 #665 backup role 向けに GCS バケット名・保持日数を対話収集していたが、
+#   所有者方針（2026-07-01・todo #1108）で backup / archive 系が全削除され
+#   消費者不在となったため、対話・vars 書き出しごと撤去した。
+#   binlog 保持日数は app_deploy role 側の `default(8)` で解決される
+#   （roles/app_deploy/tasks/main.yml の bat-binlog.cnf 生成タスク参照）。
 # ============================================================
-cat > /dev/tty <<'BKUPMSG'
-
----- バックアップ設定（#665 backup role） ----
-GCS バケットへの binlog 転送設定を行います。
-★ GCS SA キー JSON は構築後に手動で /etc/bat/gcs-sa-key.json へ配置してください。
-  （キー漏洩リスクのため bootstrap.sh では取り扱いません: roles/backup/README.md §3）
-BKUPMSG
-GCS_BUCKET="$(ask "バックアップ先 GCS バケット名（例: bat-backup-binlog）" "")"
-if [[ -z "$GCS_BUCKET" ]]; then
-  warn "GCS バケット名が未設定です。bat:backup:binlog-ship は BAT_BINLOG_GCS_BUCKET 未設定でスキップされます。"
-  warn "後から .env.production に BAT_BINLOG_GCS_BUCKET を追記してください（docs/runbook-backup-restore.md §2）。"
-fi
-BACKUP_RETENTION_DAYS="$(ask "バックアップ保持日数" "8")"
-BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-8}"
 
 # ============================================================
 # 収集値の書き出し（機密は infra 配下の生成 config に限定し、権限 600）
@@ -739,9 +775,6 @@ staging_mode: "${_staging_mode}"
 staging_host: "${STAGING_HOST}"
 # 機密 env ファイルの場所（app_deploy role が読み込んで .env を生成）
 secrets_env_path: "${SECRETS_FILE}"
-# バックアップ設定（#665 backup role）
-gcs_bucket: "${GCS_BUCKET}"
-backup_retention_days: ${BACKUP_RETENTION_DAYS}
 VARS
 
 # --- 機密 env（KEY=VALUE）。app_deploy role が .env 生成に使用 ---
@@ -1004,6 +1037,44 @@ PROD_HOST と PROD_USER も合わせて登録してください:
 （権限 0600・root 読み取り専用）。
 ============================================================
 DEPLOYKEYMSG
+
+# ============================================================
+# PAT 経路の後続更新に関する案内（#1192）
+#   PAT は .git/config へ恒久保存しない方針（clone / pull 直後に
+#   scrub_origin_credentials で除去）のため、以後の fetch / pull は
+#   無認証では通らない。更新手段と CD への影響を完走時に明示しておく
+#   （CD 影響の明示は review-1192 重要-2）。
+# ============================================================
+if [[ "$AUTH_METHOD" == "2" ]]; then
+  cat > /dev/tty <<PATNOTE
+
+============================================================
+${C_WARN}★ PAT 認証で構築した場合の以後のリポジトリ更新について（#1192）${C_RESET}
+
+入力された PAT はセキュリティ保護のため ${APP_DIR}/.git/config へは
+恒久保存せず、clone / pull 完了直後に remote URL から除去済みです。
+このため、以後の git fetch / git pull には改めて認証が必要です:
+
+  1) Deploy key 経路への切替（推奨）: bootstrap.sh を再実行し、
+     認証方式で「1) Deploy key」を選択して公開鍵を GitHub に登録
+     （remote が git@github.com:... の ssh 形式へ自動で付け替わります）
+  2) 再度 PAT を入力: git pull 実行時の Username に GitHub ユーザー名、
+     Password に PAT を対話入力する（PAT を URL やコマンドラインへ
+     直書きしない・シェル履歴への残置防止）
+
+${C_WARN}★ CD（GitHub Actions 自動デプロイ）への影響${C_RESET}
+
+CD デプロイ（deploy-production.yml）はサーバー上で work ユーザーが
+git fetch origin を非対話実行するため、PAT 経路のまま（資格情報なしの
+https remote）では恒常的に失敗します。本番運用では Deploy key への
+切替が必須です:
+  - 推奨: 本スクリプトを再実行して「1) Deploy key」を選択する
+    （上記 1 のとおり remote が ssh 化され、非対話 fetch が通ります）
+  - または手動で:
+    git -C ${APP_DIR} remote set-url origin git@github.com:<owner>/<repo>.git
+============================================================
+PATNOTE
+fi
 
 cat > /dev/tty <<'DONE'
 
