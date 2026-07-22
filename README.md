@@ -31,7 +31,17 @@ curl -fsSL https://raw.githubusercontent.com/nextcode-bat/bat-bootstrap/main/boo
 sudo bash bootstrap.sh
 ```
 
-対話で順に質問される（続行確認／リポURL／clone認証／配置先／環境／ドメイン／メール・DBパス／SSHユーザー・公開鍵）。
+> **任意（推奨）: 取得内容の固定と改ざん検証**
+> main の最新ではなくタグ（またはコミット SHA）で固定した URL から取得し、
+> 別経路で計算した sha256 と照合すると、配布経路の改ざん・取り違えを検出できる。
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/nextcode-bat/bat-bootstrap/<タグまたはコミットSHA>/bootstrap.sh -o bootstrap.sh
+> sha256sum bootstrap.sh
+> # 別経路（手元の git clone 等）で計算した同一版の sha256 と一致することを確認してから実行する
+> ```
+
+対話で順に質問される（続行確認／リポURL／clone認証／環境／ドメイン／メール・DBパス／公開鍵）。
 完了すると BunkerWeb 経由で HTTPS アクセスできる状態になる。
 
 ```bash
@@ -44,7 +54,7 @@ sudo bash bootstrap.sh
 #    既にユーザーが1件でも存在する場合は失敗する（1人運用ガード）。
 #    なお、migrate および db:seed は Ansible app_deploy ロールで自動実行済みのため、
 #    ここでは追加の手動投入は不要。
-cd /opt/bat-app   # bootstrap.sh の対話で別パスを指定した場合はそちらへ
+cd /opt/bat-app
 sudo docker compose exec app php artisan bat:create-user
 ```
 

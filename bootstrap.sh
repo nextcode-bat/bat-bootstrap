@@ -8,8 +8,11 @@
 #   2. private リポ（bat-app の fork）の clone（Deploy key / PAT）
 #   3. 対話で収集したパラメータを Ansible へ渡す vars / .env へ書き出し
 #   4. ansible-playbook を local connection で実行し OS を本番設定
-#   5. ★安全装置: work + TOTP ログイン成功を別端末で確認するまで停止し、
-#      確認後に root SSH を無効化する（ロックアウト防止・手順書 §7.3）
+#   5. ★root SSH の無効化は完走時に自動実行される（手順書 §7.3）。
+#      冒頭の続行確認 [y/N] の Yes をロックアウト了承とみなす 3 パス設計:
+#        [1] 全 role 適用（root SSH は維持）
+#        [2] ssh_hardening 再適用で root SSH 無効化（確認対話なし・自動）
+#        [3] TOTP 完全必須化（任意・TOTP 登録確認＋二重対話ガードで既定 skip）
 #
 # 取得・実行方法（手順書 §5.1）:
 #   curl -fsSL https://raw.githubusercontent.com/<owner>/bat-bootstrap/main/bootstrap.sh -o bootstrap.sh
@@ -17,8 +20,10 @@
 #   ※ curl | bash で直接パイプしてはならない（read による対話入力が壊れるため）。
 #   ※ 本スクリプトは対話入力をすべて /dev/tty から読むため、万一パイプ実行されても動作する。
 #
-# 冪等性（手順書 §11.1）:
-#   再実行しても安全。clone 済み→git pull、導入済みツール→スキップ、Ansible は冪等。
+# 冪等性（手順書 §12.1）:
+#   再実行しても安全。clone 済み→git pull、導入済みツール・生成済み鍵→スキップ、
+#   Ansible は冪等。DB/Redis パスワード等の機密は .env.production が既存なら
+#   再生成せず既存値を維持する（MySQL 実体と .env の食い違いによる接続不能を防止）。
 # ============================================================
 
 set -euo pipefail
@@ -81,6 +86,14 @@ ask_yes_no() {
   printf '%s [y/N]: ' "$prompt" > /dev/tty
   IFS= read -r reply < /dev/tty || true
   [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# 対話入力の軽量形式検証。打ち間違い・危険文字（引用符等）の混入を
+# vars/YAML へ書き出す前に検出して die する。
+validate_hostname() {
+  # $1=項目名 $2=値（英数字・ドット・ハイフンのみ許可）
+  [[ "$2" =~ ^[A-Za-z0-9.-]+$ ]] \
+    || die "${1} に使用できない文字が含まれています: '${2}'（英数字・ドット・ハイフンのみ使用可能）。"
 }
 
 # ------------------------------------------------------------
@@ -233,9 +246,29 @@ verify_and_pin_github_host_key() {
 
   mkdir -p "$target_dir"
 
-  # 既に github.com が登録済みなら skip（冪等性・手順書 §11.1）
+  # 既に github.com が登録済みなら skip（冪等性・手順書 §12.1）。
+  # ただし skip する前に既存行の SHA256 指紋を公式値と照合し、不一致
+  # （過去の TOFU 期に焼き付いた偽鍵の可能性）を検出したら警告と復旧手順を出す。
   if [[ -f "$target" ]] && grep -q '^github\.com ' "$target" 2>/dev/null; then
-    ok "github.com のホスト鍵は既に ${target} に固定済み（skip）。"
+    local existing_line existing_fp mismatch=0
+    while IFS= read -r existing_line; do
+      existing_fp="$(printf '%s\n' "$existing_line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)"
+      case "$existing_fp" in
+        "$GITHUB_HOST_FP_ED25519"|"$GITHUB_HOST_FP_ECDSA"|"$GITHUB_HOST_FP_RSA")
+          ;;
+        *)
+          mismatch=$((mismatch + 1))
+          warn "既存の github.com ホスト鍵が GitHub 公式指紋と不一致です: 指紋=${existing_fp:-解析不能}"
+          ;;
+      esac
+    done < <(grep '^github\.com ' "$target")
+    if (( mismatch > 0 )); then
+      warn "MITM または鍵ローテーションの可能性があります。復旧手順:"
+      warn "  1. ${target} から 'github.com ' で始まる行を削除する"
+      warn "  2. bootstrap.sh を再実行する（公式指紋と照合のうえ再固定されます）"
+    else
+      ok "github.com のホスト鍵は既に ${target} に固定済み（指紋一致を確認・skip）。"
+    fi
     return 0
   fi
 
@@ -255,8 +288,10 @@ verify_and_pin_github_host_key() {
   [[ -n "$scanned" ]] \
     || die "github.com のホスト鍵を取得できませんでした（DNS / ファイアウォール / 上流ネットワークを確認してください）。"
 
-  # 取得した各行を SHA256 指紋に変換し、埋め込み値と一致するか検証
-  local verified=0
+  # 取得した各行を SHA256 指紋に変換し、埋め込み値と一致するか検証。
+  # known_hosts へは検証に合格した行だけを追記する（未知種別の鍵を無検証で
+  # 固定しないため、合格行を verified_lines に集める）。
+  local verified=0 verified_lines=""
   local line fp_line fp algo
   while IFS= read -r line; do
     [[ -z "$line" || "$line" == \#* ]] && continue
@@ -271,18 +306,21 @@ verify_and_pin_github_host_key() {
           || die "github.com ED25519 鍵指紋が GitHub 公式値と不一致（MITM の可能性）: 取得=${fp} / 期待=${GITHUB_HOST_FP_ED25519}"
         ok "github.com ED25519 指紋一致を確認: ${fp}"
         verified=$((verified + 1))
+        verified_lines+="${line}"$'\n'
         ;;
       ECDSA)
         [[ "$fp" == "$GITHUB_HOST_FP_ECDSA" ]] \
           || die "github.com ECDSA 鍵指紋が GitHub 公式値と不一致（MITM の可能性）: 取得=${fp} / 期待=${GITHUB_HOST_FP_ECDSA}"
         ok "github.com ECDSA 指紋一致を確認: ${fp}"
         verified=$((verified + 1))
+        verified_lines+="${line}"$'\n'
         ;;
       RSA)
         [[ "$fp" == "$GITHUB_HOST_FP_RSA" ]] \
           || die "github.com RSA 鍵指紋が GitHub 公式値と不一致（MITM の可能性）: 取得=${fp} / 期待=${GITHUB_HOST_FP_RSA}"
         ok "github.com RSA 指紋一致を確認: ${fp}"
         verified=$((verified + 1))
+        verified_lines+="${line}"$'\n'
         ;;
       *)
         warn "未知の鍵種別を検出したため検証対象外（スキップ）: algo=${algo}"
@@ -294,8 +332,9 @@ verify_and_pin_github_host_key() {
   (( verified > 0 )) \
     || die "github.com のホスト鍵検証が 0 件成功でした。ssh-keyscan / ssh-keygen の出力解析に失敗している可能性があります。"
 
-  # 検証 OK: known_hosts に固定追記（追記方式: 既存の他ホストエントリを破壊しない）
-  printf '%s\n' "$scanned" >> "$target"
+  # 検証 OK: 指紋検証に合格した行だけを known_hosts に固定追記する
+  # （追記方式: 既存の他ホストエントリを破壊しない）
+  printf '%s' "$verified_lines" >> "$target"
   chmod 644 "$target"
   ok "github.com のホスト鍵 ${verified} 件を ${target} に固定しました（鍵ピンニング完了）。"
 }
@@ -325,9 +364,11 @@ to_ssh_url() {
   esac
 }
 
-# REPO_URL を https://<PAT>@github.com/owner/repo.git へ変換
-to_https_pat_url() {
-  local u="$1" pat="$2" path=""
+# REPO_URL を素の https://github.com/owner/repo.git へ正規化（PAT 認証用）。
+# PAT は URL へ埋め込まない（URL は git の引数列に載り、実行中は ps で全ユーザー
+# から観測できるため）。認証は GIT_ASKPASS の一時スクリプトが応答する。
+to_plain_https_url() {
+  local u="$1" path=""
   u="${u%$'\r'}"
   u="${u%/}"
   case "$u" in
@@ -337,7 +378,7 @@ to_https_pat_url() {
   esac
   path="${path%.git}"
   path="${path%/}"
-  printf 'https://%s@github.com/%s.git' "$pat" "$path"
+  printf 'https://github.com/%s.git' "$path"
 }
 
 # remote.origin.url から資格情報（userinfo 部）を除去する（#1192）。
@@ -414,21 +455,28 @@ DKMSG
       # 終了後に運用者が改めて `git pull` する際に Permission denied になる事故が
       # 起きる。/root/.ssh/config に Host github.com の IdentityFile を書いておけば、
       # 以降は root で素の `git pull` が通る。
-      # 冪等: 既に同マーカーのブロックがあれば置換、無ければ追記。
-      if ! grep -q "^# BEGIN BAT root github.com config" /root/.ssh/config 2>/dev/null; then
-        cat >> /root/.ssh/config <<SSHCONF
+      # 冪等: 既存のマーカー間ブロックを削除してから【ファイル先頭】へ挿入する。
+      # ssh_config は先勝ち（first-match-wins）のため、末尾追記だと既存の
+      # Host github.com 設定に先取りされて本ブロックが効かないことがある。
+      touch /root/.ssh/config
+      _ssh_cfg_rest="$(mktemp)"
+      sed '/^# BEGIN BAT root github.com config/,/^# END BAT root github.com config/d' \
+        /root/.ssh/config > "$_ssh_cfg_rest"
+      {
+        cat <<SSHCONF
 # BEGIN BAT root github.com config (managed by bootstrap.sh)
 Host github.com
   IdentityFile ${DEPLOY_KEY}
   IdentitiesOnly yes
-  # #1109: accept-new(TOFU) を撤廃し、verify_and_pin_github_host_key で
-  # 事前固定した /etc/ssh/ssh_known_hosts のエントリを厳格検証する。
+  # 事前に指紋検証のうえ /etc/ssh/ssh_known_hosts へ固定済みのエントリを厳格検証する
   StrictHostKeyChecking yes
 # END BAT root github.com config (managed by bootstrap.sh)
 SSHCONF
-        chmod 600 /root/.ssh/config
-        ok "/root/.ssh/config に github.com の IdentityFile を記録しました（後続の root git pull が通るようにするため）。"
-      fi
+        cat "$_ssh_cfg_rest"
+      } > /root/.ssh/config
+      rm -f "$_ssh_cfg_rest"
+      chmod 600 /root/.ssh/config
+      ok "/root/.ssh/config の先頭に github.com の IdentityFile ブロックを記録しました（先勝ち規則のため先頭へ・後続の root git pull 用）。"
 
       # この鍵を使う git 用 SSH コマンド。CLONE_URL は SSH 形式へ正規化する。
       # #1109: accept-new(TOFU) を撤廃し、verify_and_pin_github_host_key で
@@ -437,14 +485,33 @@ SSHCONF
       CLONE_URL="$(to_ssh_url "$REPO_URL")"
       ;;
     2)
-      # PAT を非エコーで読む。トークンはファイルにも標準出力にも残さない。
-      local pat
+      # PAT を非エコーで読む。トークンは画面・ログ・git の引数列に残さない。
+      local pat pat_escaped
       pat="$(ask_secret "Fine-grained PAT を入力してください（入力は表示されません）")"
       [[ -n "$pat" ]] || die "PAT が入力されませんでした。"
-      # https://<PAT>@github.com/... を組み立てる（手順書 §9.2）。
-      # CLONE_URL はローカル変数に閉じ込め、ログ・vars には書き出さない。
-      CLONE_URL="$(to_https_pat_url "$REPO_URL" "$pat")"
-      unset pat
+      # PAT は URL へ埋め込まず（argv は ps で全ユーザーから観測可能）、git の
+      # 認証プロンプトに応答する一時スクリプト（root 専用 700）を GIT_ASKPASS に
+      # 指定する（手順書 §9.2）。スクリプトは clone / pull 完了後に即削除し、
+      # 異常終了時の取りこぼしは trap EXIT で防ぐ。
+      GIT_ASKPASS_SCRIPT="$(mktemp /root/.bat_askpass.XXXXXX)"
+      chmod 700 "$GIT_ASKPASS_SCRIPT"
+      trap 'rm -f "${GIT_ASKPASS_SCRIPT:-}"' EXIT
+      # PAT 内の単一引用符を '\'' へエスケープして埋め込む（GitHub PAT は英数字と
+      # _ のみだが、異常入力でもスクリプトが壊れない側に倒す）。
+      local _sq="'\\''"
+      pat_escaped="${pat//\'/${_sq}}"
+      cat > "$GIT_ASKPASS_SCRIPT" <<ASKPASS
+#!/usr/bin/env bash
+case "\$1" in
+  Username*) printf '%s\n' 'x-access-token' ;;
+  *)         printf '%s\n' '${pat_escaped}' ;;
+esac
+ASKPASS
+      export GIT_ASKPASS="$GIT_ASKPASS_SCRIPT"
+      # askpass 経由以外の対話プロンプトへのフォールバックを禁止する
+      export GIT_TERMINAL_PROMPT=0
+      CLONE_URL="$(to_plain_https_url "$REPO_URL")"
+      unset pat pat_escaped
       ;;
     *)
       die "不正な選択です: ${AUTH_METHOD}（1 または 2 を入力してください）。"
@@ -461,16 +528,15 @@ prepare_clone_auth
 readonly APP_DIR="/opt/bat-app"
 
 # ============================================================
-# 6. git clone 実行（手順書 §6 手順6 / §11.1 冪等: 既存なら git pull）
+# 6. git clone 実行（手順書 §6 手順6 / §12.1 冪等: 既存なら git pull）
 # ============================================================
 if [[ -d "${APP_DIR}/.git" ]]; then
   log "既存リポジトリを検出しました。git pull で更新します（冪等）: ${APP_DIR}"
-  # 今回の対話で選択した認証方式を pull に反映する（review-1192 重要-1）。
-  # scrub 済みの素 https remote のままでは (a) Deploy key を選択しても pull に
-  # 使われず (b) PAT を再入力しても pull に乗らず、git 生の credential
-  # プロンプトが割り込む。set-url で CLONE_URL（Deploy key=ssh 形式 /
-  # PAT=認証付き https）へ付け替えてから pull し、PAT の埋め込みは直後の
-  # scrub_origin_credentials で除去する。
+  # 今回の対話で選択した認証方式を pull に反映する。
+  # set-url で CLONE_URL（Deploy key=ssh 形式 / PAT=素の https・認証は
+  # GIT_ASKPASS の一時スクリプトが応答）へ付け替えてから pull する。
+  # 過去の実行で remote に資格情報が埋め込まれていた場合は、pull 直後の
+  # scrub_origin_credentials で除去される。
   # ※ 再実行時に REPO_URL へ別リポジトリの URL を入力した場合、remote は
   #    そのリポへ付け替わる（bootstrap.sh は対話で受けた URL を正とする仕様）。
   git -C "$APP_DIR" remote set-url origin "$CLONE_URL" \
@@ -485,13 +551,17 @@ else
     || die "clone に失敗しました。URL・認証（Deploy key / PAT）の登録内容を確認してください。"
   ok "clone が完了しました。"
 fi
-# PAT 経路では clone / pull の完了直後に remote URL から資格情報を除去する（#1192）。
-# 旧実装は unset CLONE_URL のみで、.git/config に https://<PAT>@github.com/...
-# が永続残置されていた。clone / pull 自体は PAT 付き URL で実行してよく、
-# 掃除はその後に行う（過去の実行で残った資格情報もここで除去される）。
+# remote URL の資格情報掃除。現行の PAT 経路は URL へ PAT を埋め込まない
+# （GIT_ASKPASS 方式）ため通常は no-op だが、過去の実行で .git/config に
+# https://<PAT>@github.com/... が残置されている場合をここで除去する。
 scrub_origin_credentials "$APP_DIR"
-# 認証付き URL（PAT 等）はここで破棄し、以降のログ・ファイルに残さない。
 unset CLONE_URL
+# PAT 認証用の一時 askpass スクリプトは clone / pull 完了時点で用済みのため
+# 即削除する（trap EXIT は異常終了時の取りこぼし防止の保険として残す）。
+if [[ -n "${GIT_ASKPASS_SCRIPT:-}" ]]; then
+  rm -f "$GIT_ASKPASS_SCRIPT"
+  unset GIT_ASKPASS GIT_ASKPASS_SCRIPT
+fi
 
 readonly INFRA_DIR="${APP_DIR}/infra"
 [[ -d "${INFRA_DIR}/ansible" ]] \
@@ -541,6 +611,7 @@ STAGINGMENU
       STAGING_MODE="separate"
       STAGING_HOST="$(ask "staging サーバーのホスト名または IP")"
       [[ -n "$STAGING_HOST" ]] || die "STAGING_MODE=separate では STAGING_HOST は必須です。"
+      validate_hostname "staging サーバーのホスト名" "$STAGING_HOST"
       log "別サーバーモードを選択しました（STAGING_HOST=${STAGING_HOST}）。"
       ;;
     *)
@@ -558,6 +629,7 @@ elif [[ "$DEPLOY_ENV" == "staging" ]]; then
   [[ -n "$SERVER_NAME" ]] || die "検証(別サーバー)では SERVER_NAME（専用サブドメイン）は必須です。"
 fi
 [[ -n "$SERVER_NAME" ]] || die "SERVER_NAME は必須です。"
+validate_hostname "公開ドメイン（SERVER_NAME）" "$SERVER_NAME"
 
 # ============================================================
 # 9. Let's Encrypt メール / DB パスワード（手順書 §6 手順9 / 付録B）
@@ -568,6 +640,9 @@ LE_EMAIL=""
 if [[ "$DEPLOY_ENV" == "production" || "$DEPLOY_ENV" == "staging" ]]; then
   LE_EMAIL="$(ask "Let's Encrypt 用メールアドレス（証明書通知先）" "admin@next-code.jp")"
   [[ -n "$LE_EMAIL" ]] || die "本番・検証(別サーバー)では Let's Encrypt 用メールが必須です。"
+  # 形式検証: @ を含み、vars/YAML を壊す引用符を含まないこと
+  [[ "$LE_EMAIL" == *@* && "$LE_EMAIL" != *'"'* ]] \
+    || die "メールアドレスの形式が不正です: '${LE_EMAIL}'（@ を含み、\" は使用不可）。"
 fi
 
 # DB パスワード（本番・ローカル共通で必要。空欄なら自動生成）
@@ -576,19 +651,39 @@ gen_password() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32
   else
-    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32
+    # head 側から読む形にする。head | 形式だと head の終了時に tr が SIGPIPE で
+    # 非ゼロ終了し、set -o pipefail によりスクリプト全体が abort するため。
+    head -c 32 < <(tr -dc 'A-Za-z0-9' < /dev/urandom)
   fi
 }
-DB_PASSWORD="$(ask_secret "DB パスワード（空欄で自動生成）")"
-if [[ -z "$DB_PASSWORD" ]]; then
-  DB_PASSWORD="$(gen_password)"
-  ok "DB パスワードを自動生成しました（値は画面に表示しません。生成 .env に保存されます）。"
+
+# ★再実行ガード: 初回構築が完了済み（.env.production が存在）なら、
+#   DB / Redis パスワードの生成・対話・secrets.env 書き出しをすべてスキップする。
+#   再実行で新パスワードを作ると .env 側だけが更新され、MySQL 実体の
+#   パスワードは旧値のままとなり本番 DB へ接続できなくなるため
+#   （app_deploy role は secrets.env が存在すると常に .env.production を上書きする）。
+SECRETS_REUSE=0
+if [[ -f "${APP_DIR}/.env.production" ]]; then
+  SECRETS_REUSE=1
+  log "初回構築済みのため機密は既存 .env.production を維持します（${APP_DIR}/.env.production を検出・DB/Redis パスワードの再生成と対話をスキップ）。"
+else
+  DB_PASSWORD="$(ask_secret "DB パスワード（空欄で自動生成）")"
+  if [[ -z "$DB_PASSWORD" ]]; then
+    DB_PASSWORD="$(gen_password)"
+    ok "DB パスワードを自動生成しました（値は画面に表示しません。生成 .env に保存されます）。"
+  else
+    # 手入力パスワードはホワイトリスト検証する。secrets.env / .env は素朴な
+    # KEY=VALUE 形式のため、引用符・$・バックスラッシュ等が混入すると後段の
+    # 展開・パースを壊す（最悪は意図しない解釈が起きる）恐れがある。
+    [[ "$DB_PASSWORD" =~ ^[A-Za-z0-9._@%^+=:,!-]+$ ]] \
+      || die "DB パスワードに使用できない文字が含まれています（使用可能: 英数字と . _ - @ % ^ + = : , !）。"
+  fi
+  # DB root パスワードも併せて自動生成（compose の MYSQL_ROOT_PASSWORD 用）
+  DB_ROOT_PASSWORD="$(gen_password)"
+  # Redis パスワードを自動生成（docker-compose.production.yml の requirepass 必須・#1062 保護-06）
+  # 値は対話表示せず secrets.env → .env.production へ ansible 経由で注入される。
+  REDIS_PASSWORD="$(gen_password)"
 fi
-# DB root パスワードも併せて自動生成（compose の MYSQL_ROOT_PASSWORD 用）
-DB_ROOT_PASSWORD="$(gen_password)"
-# Redis パスワードを自動生成（docker-compose.production.yml の requirepass 必須・#1062 保護-06）
-# 値は対話表示せず secrets.env → .env.production へ ansible 経由で注入される。
-REDIS_PASSWORD="$(gen_password)"
 
 # ============================================================
 # 10. SSH: work 公開鍵（手順書 §6 手順10 / §7.1 / 付録B）
@@ -616,8 +711,20 @@ while IFS= read -r line < /dev/tty; do
   [[ -z "$line" ]] && break   # 1 行だけ貼って空 Enter された場合はそこで確定
   SSH_PUBKEYS+=$'\n'"$line"
 done
-[[ "$SSH_PUBKEYS" == ssh-* || "$SSH_PUBKEYS" == ecdsa-* || "$SSH_PUBKEYS" == sk-* ]] \
-  || warn "貼り付けられた公開鍵が ssh-/ecdsa-/sk- で始まっていません。形式を確認してください。"
+# 貼り付けられた各行を公開鍵として構文検証する（ssh-keygen による指紋算出）。
+# 無効な鍵のまま進むと、完走時の root SSH 自動無効化と併せて work でも
+# ログインできない完全ロックアウトに至るため、警告ではなく die で止める。
+_valid_pubkeys=0
+while IFS= read -r _pubkey_line; do
+  [[ -z "$_pubkey_line" ]] && continue
+  if ! printf '%s\n' "$_pubkey_line" | ssh-keygen -lf /dev/stdin >/dev/null 2>&1; then
+    die "公開鍵として解釈できない行があります（貼り付け内容を確認して再実行してください）: ${_pubkey_line}"
+  fi
+  _valid_pubkeys=$((_valid_pubkeys + 1))
+done <<< "$SSH_PUBKEYS"
+(( _valid_pubkeys > 0 )) \
+  || die "有効な公開鍵が 1 本もありません。work ユーザーへのログインに必須です。"
+ok "公開鍵 ${_valid_pubkeys} 本の構文検証に合格しました。"
 
 # ============================================================
 # 10b. deploy-bot 用 SSH 鍵自動生成（CD 専用ユーザー / v1.8）
@@ -708,14 +815,24 @@ fi
 # ============================================================
 
 # ============================================================
-# 収集値の書き出し（機密は infra 配下の生成 config に限定し、権限 600）
+# 収集値の書き出し（機密はリポ外の生成 config に限定し、権限 600）
 #   - vars ファイル: Ansible へ非機密パラメータを渡す（YAML）
 #   - secrets env  : 機密（DB パスワード等）を 600 で保存。app_deploy role が .env 生成に使用。
 #   ※ 機密は標準出力に出さない / bootstrap.sh にハードコードしない（手順書 §6 末尾の方針）。
 # ============================================================
-GEN_DIR="${INFRA_DIR}/.generated"
+# 生成物はリポジトリ外の /root/.bat-bootstrap/generated に置く。
+# リポ内（infra/.generated）に置くと app_deploy role の recurse chown で
+# work ユーザー所有となり、機密（secrets.env）の root 専用保護が崩れるため。
+# パスは vars の secrets_env_path として Ansible へ渡るので、role 側の変更は不要。
+GEN_DIR="/root/.bat-bootstrap/generated"
 mkdir -p "$GEN_DIR"
-chmod 700 "$GEN_DIR"
+chmod 700 /root/.bat-bootstrap "$GEN_DIR"
+# 旧配置（リポ内 infra/.generated）が過去の実行で残っていれば警告する。
+# 機密（secrets.env）が work 所有でリポ内に残置され続けるのを防ぐため。
+if [[ -e "${INFRA_DIR}/.generated" ]]; then
+  warn "旧配置の生成物ディレクトリが残っています: ${INFRA_DIR}/.generated"
+  warn "  機密（secrets.env）を含む可能性があります。内容確認のうえ削除を推奨します: rm -rf ${INFRA_DIR}/.generated"
+fi
 
 VARS_FILE="${GEN_DIR}/bootstrap_vars.yml"
 SECRETS_FILE="${GEN_DIR}/secrets.env"
@@ -746,6 +863,9 @@ else
 fi
 
 # --- 非機密 vars（YAML）。Ansible に --extra-vars で渡す ---
+# umask 077 はサブシェルへ閉じ込め、書き出し完了後は元の umask に戻す
+# （以降の処理で作られる無関係なファイルまで root 専用権限になるのを防ぐ）。
+(
 umask 077
 cat > "$VARS_FILE" <<VARS
 ---
@@ -778,6 +898,9 @@ secrets_env_path: "${SECRETS_FILE}"
 VARS
 
 # --- 機密 env（KEY=VALUE）。app_deploy role が .env 生成に使用 ---
+# 再実行（.env.production 既存）時は書き出さない。secrets.env が存在すると
+# app_deploy role が .env.production のパスワードを常に上書きするため。
+if (( ! SECRETS_REUSE )); then
 cat > "$SECRETS_FILE" <<SECRETS
 # bootstrap.sh が生成した機密値（権限 600・git 管理外）。
 # app_deploy role がこれを基に ${APP_DIR}/.env を生成する想定（手順書 付録A app_deploy）。
@@ -785,12 +908,21 @@ DB_PASSWORD=${DB_PASSWORD}
 DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
 REDIS_PASSWORD=${REDIS_PASSWORD}
 SECRETS
-chmod 600 "$VARS_FILE" "$SECRETS_FILE"
+fi
+)
+chmod 600 "$VARS_FILE"
+if [[ -f "$SECRETS_FILE" ]]; then
+  chmod 600 "$SECRETS_FILE"
+fi
 # 機密値はメモリ上からも破棄
 unset DB_PASSWORD DB_ROOT_PASSWORD REDIS_PASSWORD
 ok "対話値を書き出しました（機密は 600 で保護）:"
 log "  vars   : ${VARS_FILE}"
-log "  secrets: ${SECRETS_FILE}（DB パスワード等。画面には表示しません）"
+if (( SECRETS_REUSE )); then
+  log "  secrets: 書き出しなし（初回構築済みのため既存 .env.production の機密を維持）"
+else
+  log "  secrets: ${SECRETS_FILE}（DB パスワード等。画面には表示しません）"
+fi
 
 # ============================================================
 # Ansible 実行（手順書 §6 手順9〜 / 付録A の role 群を local connection で適用）
@@ -798,10 +930,23 @@ log "  secrets: ${SECRETS_FILE}（DB パスワード等。画面には表示し�
 #                         firewalld, fail2ban, docker, app_deploy
 #   ★この時点では ssh_hardening は root 無効化を行わない設計（後述の確認待ち後に適用）。
 # ============================================================
-# Ansible collections を導入（requirements.yml: ansible.posix の firewalld・community.docker 等）
+# Ansible collections を導入（requirements.yml: ansible.posix の firewalld・community.docker 等）。
+# 冪等: requirements.yml 記載の collection がすべて導入済みなら skip する
+# （install は毎回ネットワークへ出るため、再実行時の高速化とオフライン耐性のため）。
 if [[ -f "${INFRA_DIR}/ansible/requirements.yml" ]]; then
-  log "Ansible collections を導入します（requirements.yml）。"
-  ansible-galaxy collection install -r "${INFRA_DIR}/ansible/requirements.yml"
+  _installed_collections="$(ansible-galaxy collection list 2>/dev/null || true)"
+  _missing_collections=0
+  while IFS= read -r _col; do
+    [[ -z "$_col" ]] && continue
+    grep -q "^${_col} " <<< "$_installed_collections" || _missing_collections=1
+  done < <(awk '/^[[:space:]]*- name:/ {print $NF}' "${INFRA_DIR}/ansible/requirements.yml")
+  if (( _missing_collections == 0 )); then
+    ok "Ansible collections は導入済みです（skip）。"
+  else
+    log "Ansible collections を導入します（requirements.yml）。"
+    ansible-galaxy collection install -r "${INFRA_DIR}/ansible/requirements.yml" \
+      || die "ansible-galaxy collection install に失敗しました。ネットワークを確認のうえ bootstrap.sh を再実行するか、手動で 'ansible-galaxy collection install -r ${INFRA_DIR}/ansible/requirements.yml' を実行してから再実行してください。"
+  fi
 fi
 
 log "Ansible playbook を local connection で実行します（OS 設定〜コンテナ起動）。"
@@ -843,9 +988,10 @@ work ユーザー（${WORK_USER}）+ TOTP の 2 要素ログインが
     ssh ${WORK_USER}@${SERVER_IP:-<このサーバーの固定IP>}
     → 「秘密鍵（公開鍵認証）＋ TOTP 6 桁コード」でログインできること
 
-  ※ 構築直後で TOTP 未登録の場合は、root が無効化される前に
-     work で 'google-authenticator' を実行して QR を登録してください
-     （手順書 §7.2.2）。
+  ※ この後 root SSH は確認を待たずに自動で無効化されます。
+     TOTP 登録を事前に済ませていない場合は、VPS 事業者の Web コンソール
+     （シリアルコンソール）から work でログインし、'google-authenticator'
+     を実行して QR を登録してください（手順書 §7.2.2）。
 ============================================================
 NOTICE
 
@@ -879,7 +1025,7 @@ ok "root SSH ログインを無効化しました（PermitRootLogin no）。"
 #   選択肢を skip した場合は、後から手動で以下を実行して適用可能（手順書 §7.7）:
 #     cd /opt/bat-app/infra/ansible
 #     ansible-playbook -i inventory/localhost.yml site.yml -c local \
-#       --extra-vars "@/opt/bat-app/infra/.generated/bootstrap_vars.yml" \
+#       --extra-vars "@/root/.bat-bootstrap/generated/bootstrap_vars.yml" \
 #       --extra-vars "disable_root_ssh=true totp_enforce=true" \
 #       --tags totp,ssh_hardening
 # ============================================================
@@ -918,7 +1064,7 @@ work ユーザーの TOTP 6 桁コード入力を完全必須化します。
   skip した場合でも、後から手動で適用可能です（手順書 §7.7）:
     cd /opt/bat-app/infra/ansible
     ansible-playbook -i inventory/localhost.yml site.yml -c local \\
-      --extra-vars "@/opt/bat-app/infra/.generated/bootstrap_vars.yml" \\
+      --extra-vars "@/root/.bat-bootstrap/generated/bootstrap_vars.yml" \\
       --extra-vars "disable_root_ssh=true totp_enforce=true" \\
       --tags totp,ssh_hardening
 ============================================================
@@ -962,6 +1108,15 @@ PASS3INTRO
       --extra-vars "disable_root_ssh=true totp_enforce=true" \
       --tags "totp,ssh_hardening"; then
     ok "TOTP 完全必須化を適用しました（PAM nullok 除去 + deploy-bot 例外ブロック追加）。"
+    # 適用成功を vars ファイルへ永続化する（冪等: 既存行があれば置換・無ければ追記）。
+    # CLI の --extra-vars だけに頼ると、後日 vars ファイルで playbook を再適用した
+    # 際に totp_enforce が既定 false へ戻り、TOTP 必須化が黙って解除されるため。
+    if grep -q '^totp_enforce:' "$VARS_FILE" 2>/dev/null; then
+      sed -i 's/^totp_enforce:.*/totp_enforce: true/' "$VARS_FILE"
+    else
+      printf '# TOTP 完全必須化の適用済みフラグ（第 3 パス成功時に bootstrap.sh が追記）\ntotp_enforce: true\n' >> "$VARS_FILE"
+    fi
+    ok "totp_enforce: true を ${VARS_FILE} へ永続化しました（以後の再適用でも必須化が維持されます）。"
   else
     err "TOTP 完全必須化の適用に失敗しました。sshd の状態と /etc/pam.d/sshd を手動で確認してください。"
     err "  復旧: 手動で /etc/pam.d/sshd の pam_google_authenticator.so 行末に 'nullok' を戻すと元の状態に復帰します。"
@@ -969,7 +1124,11 @@ PASS3INTRO
   fi
 }
 
-apply_totp_enforce_pass3
+# 第 3 パスが失敗しても abort せず続行する。後続の機密ファイル削除対話・
+# CD 用秘密鍵の表示・完了案内はロックアウト防止と運用引き継ぎに必要なため、
+# 必ず実行する（TOTP 必須化は手順書 §7.7 の手動コマンドで後日再適用できる）。
+apply_totp_enforce_pass3 \
+  || warn "TOTP 完全必須化は失敗しましたが、後続の機密クリーンアップ・CD 鍵案内は継続します（再適用は手順書 §7.7 参照）。"
 
 # ============================================================
 # 機密ファイル cleanup（任意・推奨）
@@ -977,6 +1136,10 @@ apply_totp_enforce_pass3
 #   構築完了後はもう不要のため、ここで対話で削除可否を確認する。
 #   削除しても vars.yml は残るため再実行可能性は保たれる（再対話入力で再生成）。
 # ============================================================
+# 再実行時（.env.production 既存）は secrets.env を生成しないため、
+# ファイルが存在する場合のみ削除対話を行う。
+if [[ -f "$SECRETS_FILE" ]]; then
+
 cat > /dev/tty <<CLEANUP
 
 ============================================================
@@ -999,6 +1162,10 @@ if ask_yes_no "${SECRETS_FILE} を削除しますか？（推奨: y）"; then
   fi
 else
   warn "機密ファイルを残置しました。VPS のセキュリティに留意してください: ${SECRETS_FILE}"
+fi
+
+else
+  log "機密ファイル（secrets.env）は今回生成していないため、クリーンアップは不要です。"
 fi
 
 # ============================================================
@@ -1035,6 +1202,9 @@ PROD_HOST と PROD_USER も合わせて登録してください:
 
 秘密鍵ファイルはサーバー上に ${DEPLOY_BOT_KEY} として保存されています
 （権限 0600・root 読み取り専用）。
+
+※ 登録完了後は、秘密鍵が画面履歴に残らないよう、この端末の
+   スクロールバック（画面の遡り履歴）のクリアを推奨します。
 ============================================================
 DEPLOYKEYMSG
 
@@ -1052,7 +1222,8 @@ if [[ "$AUTH_METHOD" == "2" ]]; then
 ${C_WARN}★ PAT 認証で構築した場合の以後のリポジトリ更新について（#1192）${C_RESET}
 
 入力された PAT はセキュリティ保護のため ${APP_DIR}/.git/config へは
-恒久保存せず、clone / pull 完了直後に remote URL から除去済みです。
+保存していません（clone / pull は一時的な認証応答スクリプト経由で行い、
+remote URL へも埋め込みません。スクリプトは使用後に削除済みです）。
 このため、以後の git fetch / git pull には改めて認証が必要です:
 
   1) Deploy key 経路への切替（推奨）: bootstrap.sh を再実行し、
@@ -1079,12 +1250,14 @@ fi
 cat > /dev/tty <<'DONE'
 
 ============================================================
-  構築フロー完了。次の確認を行ってください（手順書 §10）:
+  構築フロー完了。次の確認を行ってください（手順書 §11）:
    1) https://<SERVER_NAME>/ へアクセスし証明書と WAF 応答を確認
    2) /healthz が HTTP 200 を返すこと
    3) ssh work@<IP> が 2 要素で成功し、root SSH は拒否されること
    4) GitHub Secrets に PROD_SSH_KEY / PROD_HOST / PROD_USER を登録
       （deploy-production.yml が deploy-bot として SSH ログインする）
+   5) 初回管理者ユーザーを作成する（手順書 §10）:
+      cd /opt/bat-app && docker compose exec app php artisan bat:create-user
 ============================================================
 DONE
 ok "bootstrap.sh を終了します。"
