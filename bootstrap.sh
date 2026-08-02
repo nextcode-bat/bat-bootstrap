@@ -949,6 +949,209 @@ if [[ -f "${INFRA_DIR}/ansible/requirements.yml" ]]; then
   fi
 fi
 
+# ============================================================
+# Ansible collection の実効版数チェック（playbook 実行前）
+#
+# requirements.yml の version 範囲指定は ansible-galaxy 経由の導入にしか効かない。
+# dnf の ansible バンドル（EPEL 等）は collection を同梱して配置するため、直前の
+# 導入ブロックが「名前が既にある」と判定して install を skip すると、範囲外の版が
+# そのまま playbook に使われる。実際に範囲外の community.general が使われて
+# playbook が即停止した事例があるため、実行前に「ansible が実際に読み込む版」を
+# 実測して表示し、範囲外なら対処方法を示して停止する。
+#
+# ★実効版の求め方（ansible-galaxy collection list の表示順を使わない理由）:
+#   ansible は collection 探索パスを先頭から走査し、最初に見つけた 1 つだけを
+#   読み込む（先勝ち）。一方 ansible-galaxy collection list の表示順は探索順と
+#   一致せず、python パッケージ同梱分（優先度は最下位）が先頭に表示される。
+#   表示順の先頭を実効版とみなすと誤判定するため、ここでは ansible-config が
+#   返す探索パスを順に走査し、最初に見つかった collection の版を実効版とする。
+# ============================================================
+
+# "X.Y.Z" 形式のバージョンを数値比較する。$1 < $2 のとき 0（true）。
+# 末尾のプレリリース表記（-rc1 等）は比較対象から落とす。
+version_lt() {
+  local a="${1%%-*}" b="${2%%-*}"
+  local fa fb i x y
+  IFS=. read -r -a fa <<< "$a"
+  IFS=. read -r -a fb <<< "$b"
+  for i in 0 1 2; do
+    x="${fa[$i]:-0}"
+    y="${fb[$i]:-0}"
+    [[ "$x" =~ ^[0-9]+$ ]] || x=0
+    [[ "$y" =~ ^[0-9]+$ ]] || y=0
+    if (( 10#$x < 10#$y )); then return 0; fi
+    if (( 10#$x > 10#$y )); then return 1; fi
+  done
+  return 1
+}
+
+# 実効版 $1 が範囲指定 $2（">=7.0.0,<11.0.0" 形式）を満たすなら 0。
+# 解釈できない指定は判定対象外として無視する（誤検知で構築を止めないため）。
+version_in_spec() {
+  local ver="$1" spec="$2" cons bound
+  while IFS= read -r cons; do
+    [[ -z "$cons" ]] && continue
+    case "$cons" in
+      '>='*) bound="${cons#>=}"; if version_lt "$ver" "$bound"; then return 1; fi ;;
+      '>'*)  bound="${cons#>}";  if ! version_lt "$bound" "$ver"; then return 1; fi ;;
+      '<='*) bound="${cons#<=}"; if version_lt "$bound" "$ver"; then return 1; fi ;;
+      '<'*)  bound="${cons#<}";  if ! version_lt "$ver" "$bound"; then return 1; fi ;;
+      '=='*) bound="${cons#==}"; if [[ "$ver" != "$bound" ]]; then return 1; fi ;;
+      '!='*) bound="${cons#!=}"; if [[ "$ver" == "$bound" ]]; then return 1; fi ;;
+      *) : ;;
+    esac
+  done < <(tr ',' '\n' <<< "$spec")
+  return 0
+}
+
+# collection ディレクトリ $1 の版数を標準出力へ返す（読めなければ 1 を返す）。
+read_collection_version() {
+  local dir="$1" ver=""
+  if [[ -f "${dir}/MANIFEST.json" ]]; then
+    ver="$(awk 'match($0, /"version"[[:space:]]*:[[:space:]]*"[^"]+"/) {
+                  s = substr($0, RSTART, RLENGTH)
+                  sub(/^"version"[[:space:]]*:[[:space:]]*"/, "", s)
+                  sub(/"$/, "", s)
+                  print s
+                  exit
+                }' "${dir}/MANIFEST.json")" || true
+  fi
+  # galaxy 以外の配置（ソースツリーをそのまま置いた場合）は galaxy.yml を見る
+  if [[ -z "$ver" && -f "${dir}/galaxy.yml" ]]; then
+    ver="$(awk '$1 == "version:" { print $2; exit }' "${dir}/galaxy.yml" | tr -d "\"'")" || true
+  fi
+  [[ -n "$ver" ]] || return 1
+  printf '%s' "$ver"
+}
+
+# collection $1（"namespace.name"）の実効版を "版数<TAB>検出パス" で返す。
+# 判定できない場合は何も出力せず 1 を返す。
+effective_collection_version() {
+  local fqcn="$1"
+  local ns="${fqcn%%.*}" name="${fqcn#*.}"
+  local search_paths p coll_dir ver
+
+  # ansible-config dump の該当行:
+  #   COLLECTIONS_PATHS(default) = ['/root/.ansible/collections', '/usr/share/ansible/collections']
+  search_paths="$(ansible-config dump 2>/dev/null \
+    | sed -n 's/^COLLECTIONS_PATHS([^)]*) = //p' \
+    | tr -d "[]' " | tr ',' '\n')" || true
+
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    coll_dir="${p}/ansible_collections/${ns}/${name}"
+    [[ -d "$coll_dir" ]] || continue
+    # 先勝ちのため、最初に見つかったディレクトリで判定を打ち切る。版数が読めなくても
+    # 後続パスへ進まない（進むと優先度の低い版を実効版と誤って報告してしまう）。
+    if ver="$(read_collection_version "$coll_dir")"; then
+      printf '%s\t%s' "$ver" "$coll_dir"
+      return 0
+    fi
+    return 1
+  done <<< "$search_paths"
+
+  # 探索パスのどこにも無い場合、残る供給元は python パッケージ同梱分のみ
+  # （優先度は最下位）。この状況では list に出る行も同梱分に限られるため、
+  # 最初の該当行をそのまま実効版とみなせる。
+  ver="$(ansible-galaxy collection list "$fqcn" 2>/dev/null \
+    | awk -v c="$fqcn" '$1 == c { print $2; exit }')" || true
+  if [[ -n "$ver" ]]; then
+    printf '%s\t%s' "$ver" "python パッケージ同梱"
+    return 0
+  fi
+  return 1
+}
+
+# requirements.yml $1 から collection $2 の version 範囲指定を取り出す。
+collection_pin_spec() {
+  awk -v target="$2" '
+    $1 == "-" && $2 == "name:" { current = $3; next }
+    $1 == "version:" && current == target {
+      v = $0
+      sub(/^[[:space:]]*version:[[:space:]]*/, "", v)
+      print v
+      exit
+    }' "$1" | tr -d "\"' "
+}
+
+# requirements.yml $1 の全 collection について実効版を表示し、範囲外があれば 1 を返す。
+verify_collection_pins() {
+  local req_file="$1"
+  local fqcn spec ver_path ver path violations=0
+
+  while IFS= read -r fqcn; do
+    [[ -z "$fqcn" ]] && continue
+    spec="$(collection_pin_spec "$req_file" "$fqcn")" || true
+    ver_path="$(effective_collection_version "$fqcn")" || true
+    if [[ -z "$ver_path" ]]; then
+      warn "  ${fqcn}: 実効版数を判定できませんでした（範囲チェックを skip）。"
+      continue
+    fi
+    ver="${ver_path%%$'\t'*}"
+    path="${ver_path#*$'\t'}"
+    if [[ -z "$spec" ]]; then
+      log "  ${fqcn}: ${ver}（版数指定なし / ${path}）"
+    elif version_in_spec "$ver" "$spec"; then
+      ok "  ${fqcn}: ${ver}（指定 ${spec} を満たす / ${path}）"
+    else
+      err "  ${fqcn}: ${ver} は指定範囲 ${spec} を外れています（${path}）"
+      violations=$((violations + 1))
+    fi
+  done < <(awk '$1 == "-" && $2 == "name:" { print $3 }' "$req_file")
+
+  (( violations == 0 ))
+}
+
+if [[ -f "${INFRA_DIR}/ansible/requirements.yml" ]]; then
+  log "Ansible collection の実効版数を確認します（requirements.yml の指定範囲と照合）。"
+  if verify_collection_pins "${INFRA_DIR}/ansible/requirements.yml"; then
+    ok "Ansible collection の実効版数チェックを完了しました（指定範囲外の検出なし）。"
+  else
+    cat >&2 <<PINFAIL
+
+============================================================
+★ Ansible collection の版数が requirements.yml の指定範囲から外れています
+============================================================
+
+上に [FAIL] で示した collection は、指定範囲の外にある版が「実際に読み込まれる版」
+になっています。このまま playbook を実行すると、モジュールの引数・戻り値の非互換に
+より構築が途中で停止する可能性があります（過去に範囲外の community.general が
+使われて playbook が即停止した事例があります）。
+
+【この範囲指定の意図】
+  collection の major 更新はモジュール仕様や戻り値の破壊的変更を伴うことがあります。
+  範囲指定は「構築が成功すると分かっている版の幅」に固定し、現地サーバーで同じ構成を
+  後から再現できるようにするためのものです。
+
+【なぜ範囲指定が効かないことがあるか】
+  範囲指定は ansible-galaxy 経由の導入にのみ効きます。dnf の ansible バンドル
+  （EPEL 等）は collection を同梱して配置するため、名前だけが既に存在する状態になり、
+  本スクリプトの導入処理が「導入済み」と判断して skip することがあります。
+  その場合、同梱された範囲外の版がそのまま使われます。
+
+【入れ替え手順】
+  1. 指定範囲の版を優先パスへ導入し直す（推奨）:
+
+       ansible-galaxy collection install -r ${INFRA_DIR}/ansible/requirements.yml --force
+
+     ansible は collection 探索パスを先頭から見て最初に見つけた 1 つを使うため、
+     上記で導入した版が同梱版より優先されます。
+
+  2. bootstrap.sh を再実行する（本スクリプトは冪等です）。再実行時に本チェックが
+     再度走り、指定範囲に収まっていれば構築が続行されます。
+
+  ※ 1 で解決しない場合は、collection を同梱する ansible バンドルを外し、
+     ansible-core と ansible-galaxy 導入分のみの構成へ寄せてください:
+
+       dnf remove ansible     # ansible-core は残ります
+       ansible-galaxy collection install -r ${INFRA_DIR}/ansible/requirements.yml
+
+============================================================
+PINFAIL
+    die "Ansible collection の版数が指定範囲外のため中止しました（上記の入れ替え手順を実施してから再実行してください）。"
+  fi
+fi
+
 log "Ansible playbook を local connection で実行します（OS 設定〜コンテナ起動）。"
 ansible-playbook \
   -i "${INFRA_DIR}/ansible/inventory/localhost.yml" \
