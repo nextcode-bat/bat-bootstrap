@@ -568,82 +568,30 @@ readonly INFRA_DIR="${APP_DIR}/infra"
   || die "infra/ansible が見つかりません: ${INFRA_DIR}/ansible（リポジトリ構成を確認してください）。"
 
 # ============================================================
-# 7. 環境の選択（手順書 §6 手順7 / 付録B）
-#    #599 Phase B: 「local」オプションを廃止し「検証(別サーバー)」へ置換。
+# 7. 構築対象
+#    本スクリプトは本番サーバー構築専用。
 #    ローカル開発環境は bootstrap 対象外（docker compose up で手動起動）。
-#    1) 本番（Let's Encrypt）  2) 検証/staging（別サーバー・Let's Encrypt）
 # ============================================================
-cat > /dev/tty <<'ENVMENU'
-
-構築する環境を選択してください（手順書 §8.1 TLS モード / #599 Phase B）:
-  1) 本番        … Let's Encrypt の正式証明書（USE_LETS_ENCRYPT=yes / HSTS 有効）
-  2) 検証(別サーバー) … 専用サブドメイン + Let's Encrypt（HSTS 有効・bootstrap で別サーバーを構築）
-  ※ ローカル開発環境は bootstrap 対象外。docker compose up -d で手動起動してください。
-ENVMENU
-ENV_CHOICE="$(ask "番号を入力" "1")"
-case "$ENV_CHOICE" in
-  1) DEPLOY_ENV="production" ;;
-  2) DEPLOY_ENV="staging" ;;
-  *) die "不正な選択です: ${ENV_CHOICE}（1 または 2 を入力してください）。" ;;
-esac
-
-# ============================================================
-# 7a. 本番選択時: このサーバーに staging を同居させるか対話（#599 Phase B）
-#     同居=STAGING_MODE=colocated / 別鯖=STAGING_MODE=separate
-# ============================================================
-STAGING_MODE=""
-STAGING_HOST=""
-
-if [[ "$DEPLOY_ENV" == "production" ]]; then
-  cat > /dev/tty <<'STAGINGMENU'
-
-このサーバーに検証環境(staging)を同居させますか？（手順書 §8.3 / #599 Phase B）:
-  1) 同居（colocated） … 同一サーバー上でポート 18443 で staging を起動
-  2) 別サーバー（separate） … 別途 staging サーバーを bootstrap で構築
-STAGINGMENU
-  STAGING_CHOICE="$(ask "番号を入力" "1")"
-  case "$STAGING_CHOICE" in
-    1)
-      STAGING_MODE="colocated"
-      log "検証-同居モードを選択しました。staging は同サーバー上のポート 18443 で起動します（自己署名）。"
-      ;;
-    2)
-      STAGING_MODE="separate"
-      STAGING_HOST="$(ask "staging サーバーのホスト名または IP")"
-      [[ -n "$STAGING_HOST" ]] || die "STAGING_MODE=separate では STAGING_HOST は必須です。"
-      validate_hostname "staging サーバーのホスト名" "$STAGING_HOST"
-      log "別サーバーモードを選択しました（STAGING_HOST=${STAGING_HOST}）。"
-      ;;
-    *)
-      die "不正な選択です: ${STAGING_CHOICE}（1 または 2 を入力してください）。" ;;
-  esac
-fi
+readonly DEPLOY_ENV="production"
+log "本番環境を構築します（Let's Encrypt / HSTS 有効）。"
 
 # ============================================================
 # 8. ドメイン（SERVER_NAME）（手順書 §6 手順8 / 付録B）
 # ============================================================
-if [[ "$DEPLOY_ENV" == "production" ]]; then
-  SERVER_NAME="$(ask "公開ドメイン（SERVER_NAME）" "bat.next-code.jp")"
-elif [[ "$DEPLOY_ENV" == "staging" ]]; then
-  SERVER_NAME="$(ask "検証用サブドメイン（例: staging.bat.next-code.jp）")"
-  [[ -n "$SERVER_NAME" ]] || die "検証(別サーバー)では SERVER_NAME（専用サブドメイン）は必須です。"
-fi
+SERVER_NAME="$(ask "公開ドメイン（SERVER_NAME）" "bat.next-code.jp")"
 [[ -n "$SERVER_NAME" ]] || die "SERVER_NAME は必須です。"
 validate_hostname "公開ドメイン（SERVER_NAME）" "$SERVER_NAME"
 
 # ============================================================
 # 9. Let's Encrypt メール / DB パスワード（手順書 §6 手順9 / 付録B）
-#    本番・検証(別サーバー)はいずれも LE が必要。
+#    本番では LE が必要。
 #    DB パスワードは空欄なら openssl で自動生成（標準出力には出さない）。
 # ============================================================
-LE_EMAIL=""
-if [[ "$DEPLOY_ENV" == "production" || "$DEPLOY_ENV" == "staging" ]]; then
-  LE_EMAIL="$(ask "Let's Encrypt 用メールアドレス（証明書通知先）" "admin@next-code.jp")"
-  [[ -n "$LE_EMAIL" ]] || die "本番・検証(別サーバー)では Let's Encrypt 用メールが必須です。"
-  # 形式検証: @ を含み、vars/YAML を壊す引用符を含まないこと
-  [[ "$LE_EMAIL" == *@* && "$LE_EMAIL" != *'"'* ]] \
-    || die "メールアドレスの形式が不正です: '${LE_EMAIL}'（@ を含み、\" は使用不可）。"
-fi
+LE_EMAIL="$(ask "Let's Encrypt 用メールアドレス（証明書通知先）" "admin@next-code.jp")"
+[[ -n "$LE_EMAIL" ]] || die "本番では Let's Encrypt 用メールが必須です。"
+# 形式検証: @ を含み、vars/YAML を壊す引用符を含まないこと
+[[ "$LE_EMAIL" == *@* && "$LE_EMAIL" != *'"'* ]] \
+  || die "メールアドレスの形式が不正です: '${LE_EMAIL}'（@ を含み、\" は使用不可）。"
 
 # DB パスワード（本番・ローカル共通で必要。空欄なら自動生成）
 gen_password() {
@@ -837,30 +785,10 @@ fi
 VARS_FILE="${GEN_DIR}/bootstrap_vars.yml"
 SECRETS_FILE="${GEN_DIR}/secrets.env"
 
-# --- cert モード判定（#599 Phase B）---
-# 本番=LE / 検証-別鯖=LE / 検証-同居=自己署名 / ローカル=自己署名（bootstrap 対象外）
-_use_letsencrypt="no"
-_generate_self_signed="no"
-_use_hsts="no"
-case "$DEPLOY_ENV" in
-  production)
-    _use_letsencrypt="yes"
-    _use_hsts="yes"
-    ;;
-  staging)
-    # 別サーバー検証: LE + HSTS 有効
-    _use_letsencrypt="yes"
-    _use_hsts="yes"
-    ;;
-esac
-# 同居検証の自己署名は staging compose（docker-compose.staging.yml）が GENERATE_SELF_SIGNED_SSL=yes で制御するため、
-# 本 vars には generate_self_signed=no（本番 compose は LE が前提）を書き出す。
-if [[ "$STAGING_MODE" == "colocated" ]]; then
-  # 同居 staging 専用フラグ（app_deploy role が staging compose を追加起動するため記録）
-  _staging_mode="colocated"
-else
-  _staging_mode="${STAGING_MODE:-none}"
-fi
+# --- 本番 TLS モード ---
+readonly _use_letsencrypt="yes"
+readonly _generate_self_signed="no"
+readonly _use_hsts="yes"
 
 # --- 非機密 vars（YAML）。Ansible に --extra-vars で渡す ---
 # umask 077 はサブシェルへ閉じ込め、書き出し完了後は元の umask に戻す
@@ -887,12 +815,6 @@ deploy_bot_ssh_authorized_keys: "${DEPLOY_BOT_PUBKEY}"
 use_letsencrypt: "${_use_letsencrypt}"
 generate_self_signed: "${_generate_self_signed}"
 use_hsts: "${_use_hsts}"
-# 検証環境モード（#599 Phase B §8）
-# colocated=本番同居（app_deploy role が staging compose も追加起動）
-# separate=別サーバー構築（staging サーバー上で bootstrap を実行）
-# none=staging 構築なし
-staging_mode: "${_staging_mode}"
-staging_host: "${STAGING_HOST}"
 # 機密 env ファイルの場所（app_deploy role が読み込んで .env を生成）
 secrets_env_path: "${SECRETS_FILE}"
 VARS
