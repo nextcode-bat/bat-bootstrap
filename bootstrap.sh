@@ -9,10 +9,10 @@
 #   3. 対話で収集したパラメータを Ansible へ渡す vars / .env へ書き出し
 #   4. ansible-playbook を local connection で実行し OS を本番設定
 #   5. ★root SSH の無効化は完走時に自動実行される（手順書 §7.3）。
-#      冒頭の続行確認 [y/N] の Yes をロックアウト了承とみなす 3 パス設計:
+#      冒頭の続行確認 [y/N] 後、2 パスで構築する:
 #        [1] 全 role 適用（root SSH は維持）
 #        [2] ssh_hardening 再適用で root SSH 無効化（確認対話なし・自動）
-#        [3] TOTP 完全必須化（任意・TOTP 登録確認＋二重対話ガードで既定 skip）
+#      TOTP は任意登録。未登録なら公開鍵のみ、登録済みなら公開鍵 + TOTP。
 #
 # 取得・実行方法（手順書 §5.1）:
 #   curl -fsSL https://raw.githubusercontent.com/<owner>/bat-bootstrap/main/bootstrap.sh -o bootstrap.sh
@@ -120,13 +120,11 @@ cat > /dev/tty <<BANNER
   （詳細: BAT_サーバー構築手順書 §6 対話フロー）
 
 ${C_WARN}★本スクリプトは構築完了時に root SSH を自動的に無効化します（手順書 §7.3）。${C_RESET}
-  ロックアウト防止のため、実行前に以下を別端末で必ず確認してください:
-    1. work ユーザーで公開鍵 SSH ログインができること
-    2. work ユーザーで 'google-authenticator' を実行し TOTP 登録済みであること
-    3. work ユーザーで「鍵＋TOTP 6桁」の 2 要素ログインが成功すること
-  ※ 初回構築時は work ユーザーがまだ存在しません。その場合は本スクリプト
-     完走後、root が無効化される直前に work が自動作成されるため、
-     構築完了後の最初のログインまでに上記 1〜3 を必ず済ませてください。
+  手元の SSH 秘密鍵に対応する公開鍵を、この後 work ユーザーへ登録します。
+  初回は work が自動作成され、公開鍵だけで SSH ログインできます。
+  TOTP は任意です。work で google-authenticator を実行した場合は、
+  以後の SSH ログインで公開鍵に加えて TOTP コードが必要です。
+  作業中の root セッションは、work でログインできるまで閉じないでください。
 ============================================================
 
 BANNER
@@ -266,6 +264,7 @@ verify_and_pin_github_host_key() {
       warn "MITM または鍵ローテーションの可能性があります。復旧手順:"
       warn "  1. ${target} から 'github.com ' で始まる行を削除する"
       warn "  2. bootstrap.sh を再実行する（公式指紋と照合のうえ再固定されます）"
+      die "既存の github.com ホスト鍵を検証できないため中止しました。"
     else
       ok "github.com のホスト鍵は既に ${target} に固定済み（指紋一致を確認・skip）。"
     fi
@@ -341,27 +340,9 @@ verify_and_pin_github_host_key() {
 
 # REPO_URL を SSH 形式（git@github.com:owner/repo.git）へ正規化
 to_ssh_url() {
-  local u="$1"
-  # 二重防御: ask 側で除去済だが、念のため末尾 CR / スラッシュも除去する。
-  u="${u%$'\r'}"
-  u="${u%/}"
-  case "$u" in
-    git@*)
-      # git@github.com:owner/repo or git@github.com:owner/repo.git → 末尾 .git を一旦剥がして付け直す
-      local path_part="${u#git@github.com:}"
-      path_part="${path_part%.git}"
-      path_part="${path_part%/}"
-      printf 'git@github.com:%s.git' "$path_part"
-      ;;
-    https://github.com/*)
-      # https://github.com/owner/repo(.git)(/) → git@github.com:owner/repo.git
-      local path="${u#https://github.com/}"
-      path="${path%.git}"
-      path="${path%/}"
-      printf 'git@github.com:%s.git' "$path"
-      ;;
-    *) printf '%s' "$u" ;;
-  esac
+  local https_url
+  https_url="$(to_plain_https_url "$1")" || return 1
+  printf 'git@github.com:%s' "${https_url#https://github.com/}"
 }
 
 # REPO_URL を素の https://github.com/owner/repo.git へ正規化（PAT 認証用）。
@@ -374,10 +355,12 @@ to_plain_https_url() {
   case "$u" in
     https://github.com/*) path="${u#https://github.com/}" ;;
     git@github.com:*)     path="${u#git@github.com:}" ;;
-    *) die "PAT 認証では https/ssh の GitHub URL を指定してください: ${u}" ;;
+    *) die "https/ssh の GitHub URL を指定してください。" ;;
   esac
   path="${path%.git}"
   path="${path%/}"
+  [[ "$path" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$ && "${path#*/}" != "." && "${path#*/}" != ".." ]] \
+    || die "GitHub URL は owner/repository の形式で指定してください。"
   printf 'https://github.com/%s.git' "$path"
 }
 
@@ -535,19 +518,20 @@ if [[ -d "${APP_DIR}/.git" ]]; then
   # 今回の対話で選択した認証方式を pull に反映する。
   # set-url で CLONE_URL（Deploy key=ssh 形式 / PAT=素の https・認証は
   # GIT_ASKPASS の一時スクリプトが応答）へ付け替えてから pull する。
+  # credential.helper は無効化し、入力 PAT の既存ヘルパーへの保存を防ぐ。
   # 過去の実行で remote に資格情報が埋め込まれていた場合は、pull 直後の
   # scrub_origin_credentials で除去される。
   # ※ 再実行時に REPO_URL へ別リポジトリの URL を入力した場合、remote は
   #    そのリポへ付け替わる（bootstrap.sh は対話で受けた URL を正とする仕様）。
   git -C "$APP_DIR" remote set-url origin "$CLONE_URL" \
-    || warn "remote origin の付け替えに失敗しました。既存 remote のまま pull を試行します。"
-  git -C "$APP_DIR" pull --ff-only \
-    || warn "git pull に失敗しました（認証・ローカル変更・ブランチ差異の可能性）。既存コードのまま続行します。"
+    || die "remote origin の更新に失敗したため中止しました。"
+  git -c credential.helper= -C "$APP_DIR" pull --ff-only \
+    || die "git pull に失敗したため中止しました。認証・ローカル変更・ブランチを確認してください。"
   ok "リポジトリを更新しました。"
 else
   log "リポジトリを clone します: ${APP_DIR}"
   mkdir -p "$(dirname "$APP_DIR")"
-  git clone "$CLONE_URL" "$APP_DIR" \
+  git -c credential.helper= clone "$CLONE_URL" "$APP_DIR" \
     || die "clone に失敗しました。URL・認証（Deploy key / PAT）の登録内容を確認してください。"
   ok "clone が完了しました。"
 fi
@@ -590,8 +574,8 @@ validate_hostname "公開ドメイン（SERVER_NAME）" "$SERVER_NAME"
 LE_EMAIL="$(ask "Let's Encrypt 用メールアドレス（証明書通知先）" "admin@next-code.jp")"
 [[ -n "$LE_EMAIL" ]] || die "本番では Let's Encrypt 用メールが必須です。"
 # 形式検証: @ を含み、vars/YAML を壊す引用符を含まないこと
-[[ "$LE_EMAIL" == *@* && "$LE_EMAIL" != *'"'* ]] \
-  || die "メールアドレスの形式が不正です: '${LE_EMAIL}'（@ を含み、\" は使用不可）。"
+[[ "$LE_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] \
+  || die "メールアドレスの形式が不正です。"
 
 # DB パスワード（本番・ローカル共通で必要。空欄なら自動生成）
 gen_password() {
@@ -605,11 +589,9 @@ gen_password() {
   fi
 }
 
-# ★再実行ガード: 初回構築が完了済み（.env.production が存在）なら、
-#   DB / Redis パスワードの生成・対話・secrets.env 書き出しをすべてスキップする。
-#   再実行で新パスワードを作ると .env 側だけが更新され、MySQL 実体の
-#   パスワードは旧値のままとなり本番 DB へ接続できなくなるため
-#   （app_deploy role は secrets.env が存在すると常に .env.production を上書きする）。
+# .env.production が存在する再実行では、DB / Redis パスワードを再生成しない。
+# app_deploy role は既存の有効な値を維持し、初回構築の中断で残った
+# 未設定項目だけを初回生成済みの secrets.env から補完する。
 SECRETS_REUSE=0
 if [[ -f "${APP_DIR}/.env.production" ]]; then
   SECRETS_REUSE=1
@@ -643,7 +625,7 @@ readonly WORK_USER="work"
 cat > /dev/tty <<'PUBKEYMSG'
 
 work ユーザーの authorized_keys に登録する【公開鍵】を貼り付けてください（手順書 §7.1）。
-  - 1 行（ssh-ed25519 ... のような行）をそのまま貼り付け、Enter。
+  - 1 行（ssh-ed25519 ... のような行）を貼り付け、最後に空行を入力。
   - 複数行・複数鍵を登録する場合は行を貼り付け、最後に END だけの行を入力。
 PUBKEYMSG
 SSH_PUBKEYS=""
@@ -820,8 +802,8 @@ secrets_env_path: "${SECRETS_FILE}"
 VARS
 
 # --- 機密 env（KEY=VALUE）。app_deploy role が .env 生成に使用 ---
-# 再実行（.env.production 既存）時は書き出さない。secrets.env が存在すると
-# app_deploy role が .env.production のパスワードを常に上書きするため。
+# .env.production がある再実行では、既存資格情報と中断時の復旧用値を
+# 保持するため、初回生成済みの secrets.env を書き換えない。
 if (( ! SECRETS_REUSE )); then
 cat > "$SECRETS_FILE" <<SECRETS
 # bootstrap.sh が生成した機密値（権限 600・git 管理外）。
@@ -1094,29 +1076,27 @@ ok "Ansible によるサーバー設定が完了しました。"
 #   【設計メモ】2-pass フロー（1回目 disable=false / 2回目 disable=true）は
 #   ssh_hardening role 内の when ガードに依存しており、role 自体は冪等のため
 #   再適用しても sshd reload 以外の副作用はない。
-#   work + TOTP の事前準備が未完で本処理が走った場合、root 無効化後に
-#   work でログインできない事故が起きうるため、冒頭バナーの 1〜3 を必ず
-#   完了させてから bootstrap.sh を実行すること。
+#   work の公開鍵を事前検証し、全 role が成功した場合だけ実行する。
+#   TOTP は nullok のため、初回構築時は登録なしで公開鍵ログインできる。
 # ============================================================
 # G7-R-12: hostname -I の重複実行を変数化（NIC 順序変化による結果差異リスク回避）。
 # 本変数はこの後の NOTICE 表示と完走時の SERVER_PRIMARY_IP 表示の両方で再利用する。
-readonly SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')" || SERVER_IP=""
+readonly SERVER_IP
 cat > /dev/tty <<NOTICE
 
 ============================================================
 ${C_WARN}★ root SSH を自動的に無効化します（手順書 §7.3）${C_RESET}
 
-work ユーザー（${WORK_USER}）+ TOTP の 2 要素ログインが
-別端末で成功する状態であることを前提に処理を進めます。
+work ユーザー（${WORK_USER}）へ公開鍵を登録済みです。
+TOTP 未登録なら公開鍵だけでログインできます。
 
   別端末での確認コマンド:
     ssh ${WORK_USER}@${SERVER_IP:-<このサーバーの固定IP>}
-    → 「秘密鍵（公開鍵認証）＋ TOTP 6 桁コード」でログインできること
 
-  ※ この後 root SSH は確認を待たずに自動で無効化されます。
-     TOTP 登録を事前に済ませていない場合は、VPS 事業者の Web コンソール
-     （シリアルコンソール）から work でログインし、'google-authenticator'
-     を実行して QR を登録してください（手順書 §7.2.2）。
+  登録済みの場合は TOTP コードも必要です。
+  この後 root SSH は自動で無効化されます。
+  work でログインできるまで、現在の root セッションを閉じないでください。
 ============================================================
 NOTICE
 
@@ -1129,131 +1109,6 @@ ansible-playbook \
   --extra-vars "disable_root_ssh=true" \
   --tags ssh_hardening
 ok "root SSH ログインを無効化しました（PermitRootLogin no）。"
-
-# ============================================================
-# TOTP 完全必須化（第 3 パス・任意 / #1110）
-#
-#   目的: PAM から nullok を除去し、~/.google_authenticator を持たないユーザーを
-#         ログイン不可にする（TOTP を「未登録でも通せる状態」から「完全必須」へ格上げ）。
-#
-#   ロックアウトリスク:
-#     - work ユーザーが TOTP 未登録のまま本パスが走ると、公開鍵単独ログインが
-#       不可になり、次回ログイン時にロックアウトする。
-#     - deploy-bot（CD 用）は Match User publickey の例外ブロックが必要
-#       （ssh_hardening §7a / users §9c が管理）。
-#
-#   セーフガード（3 段構え）:
-#     1. work の ~/.google_authenticator の存在確認（未登録なら本パス全体を skip）
-#     2. 1 段目の対話 [y/N]（既定 No で skip）
-#     3. 2 段目の対話 [y/N]「別端末での 2 要素ログイン成功を確認済か？」（既定 No で skip）
-#
-#   選択肢を skip した場合は、後から手動で以下を実行して適用可能（手順書 §7.7）:
-#     cd /opt/bat-app/infra/ansible
-#     ansible-playbook -i inventory/localhost.yml site.yml -c local \
-#       --extra-vars "@/root/.bat-bootstrap/generated/bootstrap_vars.yml" \
-#       --extra-vars "disable_root_ssh=true totp_enforce=true" \
-#       --tags totp,ssh_hardening
-# ============================================================
-
-# work ユーザーが TOTP 登録済みか（~/.google_authenticator の存在で判定）。
-# 存在すれば 0（true）、無ければ 1（false）を返す。bootstrap.sh は root 実行のため
-# 直接 test -f で判定可能（work ユーザーの su は不要）。
-ssh_check_totp_registered() {
-  local ga_path="/home/${WORK_USER}/.google_authenticator"
-  if [[ -f "$ga_path" ]]; then
-    ok "TOTP 登録を検出: ${ga_path}"
-    return 0
-  fi
-  warn "TOTP 登録形跡なし: ${ga_path} が存在しません。"
-  return 1
-}
-
-# 第 3 パス（TOTP 完全必須化）を対話ガード付きで適用する。
-# ★対話は Enter / N で必ず「skip（安全側）」に倒れる。yes を明示入力しない限り実行しない。
-# ★2 段構えの対話に加えて、TOTP 未登録なら対話に入る前に skip する。
-apply_totp_enforce_pass3() {
-  cat > /dev/tty <<PASS3INTRO
-
-============================================================
-${C_WARN}★ TOTP 完全必須化（nullok 除去）の適用ステップに進みます（#1110）${C_RESET}
-
-本ステップは PAM の pam_google_authenticator から nullok を除去し、
-work ユーザーの TOTP 6 桁コード入力を完全必須化します。
-
-  実施前に必ず別端末で以下を目視確認してください:
-    - work ユーザーで '公開鍵 + TOTP 6 桁' の 2 要素ログインが成功すること
-
-  未確認のまま「はい」を選択すると、次回ログイン時に work がロックアウト
-  する危険があります（サーバー再構築が必要になります）。
-
-  skip した場合でも、後から手動で適用可能です（手順書 §7.7）:
-    cd /opt/bat-app/infra/ansible
-    ansible-playbook -i inventory/localhost.yml site.yml -c local \\
-      --extra-vars "@/root/.bat-bootstrap/generated/bootstrap_vars.yml" \\
-      --extra-vars "disable_root_ssh=true totp_enforce=true" \\
-      --tags totp,ssh_hardening
-============================================================
-PASS3INTRO
-
-  # ------------------------------------------------------------
-  # ガード 1: work ユーザーの TOTP 登録有無
-  # ------------------------------------------------------------
-  if ! ssh_check_totp_registered; then
-    warn "work ユーザー (${WORK_USER}) の TOTP が未登録のため、本パスは skip します。"
-    warn "手順: work で 'google-authenticator' を実行して QR 登録した後、"
-    warn "  別端末で 2 要素ログイン成功を確認してから、上記の手動コマンドで再適用してください（手順書 §7.7）。"
-    return 0
-  fi
-
-  # ------------------------------------------------------------
-  # ガード 2: 1 段目の対話（既定 No）
-  # ------------------------------------------------------------
-  if ! ask_yes_no "TOTP 完全必須化（nullok 除去 + deploy-bot 例外ブロック追加）を適用しますか？"; then
-    log "TOTP 完全必須化を skip しました（1 段目の対話でキャンセル）。手動での再適用が可能です（手順書 §7.7）。"
-    return 0
-  fi
-
-  # ------------------------------------------------------------
-  # ガード 3: 2 段目の対話（既定 No・最終確認）
-  # ------------------------------------------------------------
-  if ! ask_yes_no "本当に適用してよいですか？別端末で work + TOTP の 2 要素ログイン成功を確認済ですか？"; then
-    log "TOTP 完全必須化を skip しました（2 段目の対話でキャンセル）。手動での再適用が可能です（手順書 §7.7）。"
-    return 0
-  fi
-
-  # ------------------------------------------------------------
-  # 第 3 パス実行（totp + ssh_hardening を totp_enforce=true / disable_root_ssh=true で再適用）
-  # ------------------------------------------------------------
-  log "Ansible 第 3 パスを totp_enforce=true / disable_root_ssh=true で実行します（--tags totp,ssh_hardening）。"
-  if ansible-playbook \
-      -i "${INFRA_DIR}/ansible/inventory/localhost.yml" \
-      "${INFRA_DIR}/ansible/site.yml" \
-      -c local \
-      --extra-vars "@${VARS_FILE}" \
-      --extra-vars "disable_root_ssh=true totp_enforce=true" \
-      --tags "totp,ssh_hardening"; then
-    ok "TOTP 完全必須化を適用しました（PAM nullok 除去 + deploy-bot 例外ブロック追加）。"
-    # 適用成功を vars ファイルへ永続化する（冪等: 既存行があれば置換・無ければ追記）。
-    # CLI の --extra-vars だけに頼ると、後日 vars ファイルで playbook を再適用した
-    # 際に totp_enforce が既定 false へ戻り、TOTP 必須化が黙って解除されるため。
-    if grep -q '^totp_enforce:' "$VARS_FILE" 2>/dev/null; then
-      sed -i 's/^totp_enforce:.*/totp_enforce: true/' "$VARS_FILE"
-    else
-      printf '# TOTP 完全必須化の適用済みフラグ（第 3 パス成功時に bootstrap.sh が追記）\ntotp_enforce: true\n' >> "$VARS_FILE"
-    fi
-    ok "totp_enforce: true を ${VARS_FILE} へ永続化しました（以後の再適用でも必須化が維持されます）。"
-  else
-    err "TOTP 完全必須化の適用に失敗しました。sshd の状態と /etc/pam.d/sshd を手動で確認してください。"
-    err "  復旧: 手動で /etc/pam.d/sshd の pam_google_authenticator.so 行末に 'nullok' を戻すと元の状態に復帰します。"
-    return 1
-  fi
-}
-
-# 第 3 パスが失敗しても abort せず続行する。後続の機密ファイル削除対話・
-# CD 用秘密鍵の表示・完了案内はロックアウト防止と運用引き継ぎに必要なため、
-# 必ず実行する（TOTP 必須化は手順書 §7.7 の手動コマンドで後日再適用できる）。
-apply_totp_enforce_pass3 \
-  || warn "TOTP 完全必須化は失敗しましたが、後続の機密クリーンアップ・CD 鍵案内は継続します（再適用は手順書 §7.7 参照）。"
 
 # ============================================================
 # 機密ファイル cleanup（任意・推奨）
@@ -1308,11 +1163,11 @@ cat > /dev/tty <<DEPLOYKEYMSG
 ============================================================
 ${C_WARN}★ GitHub Secrets PROD_SSH_KEY 登録用の秘密鍵${C_RESET}
 
-以下の秘密鍵を GitHub の Secrets に登録してください
-（GitHub Actions deploy-production.yml が deploy-bot として
- 本番にログインするのに使用します）:
+GitHub Actions の自動デプロイ用に、以下の秘密鍵を対象リポジトリの
+production environment の Secrets に登録してください。
+現在の deploy-production は main への push と手動起動に対応しています:
 
-  登録 URL : https://github.com/nextcode-bat/bat-app/settings/secrets/actions
+  登録場所 : 対象リポジトリの Settings → Environments → production
   Secret 名: PROD_SSH_KEY
   値       : 下の -----BEGIN OPENSSH PRIVATE KEY----- から
              -----END OPENSSH PRIVATE KEY----- までの全行を貼り付け
@@ -1321,9 +1176,14 @@ ${C_WARN}★ GitHub Secrets PROD_SSH_KEY 登録用の秘密鍵${C_RESET}
 $(cat "$DEPLOY_BOT_KEY")
 ----- 秘密鍵ここまで -----
 
-PROD_HOST と PROD_USER も合わせて登録してください:
+PROD_HOST / PROD_USER も登録してください:
   PROD_HOST: ${SERVER_PRIMARY_IP:-<このサーバーの固定IP>}
   PROD_USER: deploy-bot
+
+手動ロールバックを使う場合は、production-rollback environment にも
+接続用 Secrets を設定し、PROD_HOST_FINGERPRINT にホスト鍵指紋を登録します。
+サーバーのコンソールで次を実行し、SHA256:... の列を使用してください:
+  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
 
 秘密鍵ファイルはサーバー上に ${DEPLOY_BOT_KEY} として保存されています
 （権限 0600・root 読み取り専用）。
@@ -1378,11 +1238,14 @@ cat > /dev/tty <<'DONE'
   構築フロー完了。次の確認を行ってください（手順書 §11）:
    1) https://<SERVER_NAME>/ へアクセスし証明書と WAF 応答を確認
    2) /healthz が HTTP 200 を返すこと
-   3) ssh work@<IP> が 2 要素で成功し、root SSH は拒否されること
-   4) GitHub Secrets に PROD_SSH_KEY / PROD_HOST / PROD_USER を登録
-      （deploy-production.yml が deploy-bot として SSH ログインする）
+   3) ssh work@<IP> が公開鍵で成功し、root SSH は拒否されること
+      （google-authenticator 登録済みの場合のみ TOTP コードも必要）
+   4) 自動デプロイ用に production environment へ
+      PROD_SSH_KEY / PROD_HOST / PROD_USER を登録
+      （main への push と手動起動で deploy-production が実行されます）
    5) 初回管理者ユーザーを作成する（手順書 §10）:
-      cd /opt/bat-app && docker compose exec app php artisan bat:create-user
+      cd /opt/bat-app
+      docker compose --env-file .env.production -f docker-compose.production.yml exec app php artisan bat:create-user
 ============================================================
 DONE
 ok "bootstrap.sh を終了します。"
