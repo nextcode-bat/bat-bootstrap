@@ -77,7 +77,17 @@ Web アプリの 2FA 設定は SSH の TOTP 登録とは別に行う。
 
 `deploy-production` は main への push と Actions からの手動起動に対応する。
 bootstrap が表示する接続用情報を、対象リポジトリの production environment の `PROD_HOST` / `PROD_USER` / `PROD_SSH_KEY` に登録する。
-手動ロールバックを利用する場合は、production-rollback environment にも接続用 Secrets と `PROD_HOST_FINGERPRINT` を設定し、Required reviewers を構成する。
+`PROD_HOST_FINGERPRINT` も必須で、初回構築した VPS の信頼できる管理コンソールで次を実行し、出力の `SHA256:...` の列だけを登録する。
+
+```bash
+ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub -E sha256
+```
+
+固定版SSHクライアントは通常ECDSAを優先するため、標準構成ではECDSA公開鍵を使う。
+ホスト鍵構成が異なる場合は管理コンソールで `sshd -T` の `hostkey` / `hostkeyalgorithms` と鍵の種類を確認し、実際に選択される鍵の指紋を登録する（標準構成の鍵ではECDSA、RSA SHA2、ED25519の順）。
+未検証の `ssh-keyscan` 出力を信頼根拠にせず、再構築等でホスト鍵が変わった場合は管理コンソールで再確認する。
+必須 Secrets が不足していると、SSH 接続前にワークフローが停止する。
+手動ロールバックを利用する場合は、production-rollback environment にも同じ4種類の Secrets を設定し、Required reviewers を構成する。
 
 ## 構成上の位置づけ
 

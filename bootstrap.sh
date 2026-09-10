@@ -1176,14 +1176,17 @@ production environment の Secrets に登録してください。
 $(cat "$DEPLOY_BOT_KEY")
 ----- 秘密鍵ここまで -----
 
-PROD_HOST / PROD_USER も登録してください:
+PROD_HOST / PROD_USER / PROD_HOST_FINGERPRINT も登録してください:
   PROD_HOST: ${SERVER_PRIMARY_IP:-<このサーバーの固定IP>}
   PROD_USER: deploy-bot
+  PROD_HOST_FINGERPRINT: 下記で確認した SHA256:... の列
 
+指紋は信頼できるVPS管理コンソールで次を実行して確認してください:
+  ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub -E sha256
+標準構成はECDSAを使用。ホスト鍵構成を変えた場合はREADMEを参照してください。
+未検証のssh-keyscan出力を信頼の根拠にしないでください。
 手動ロールバックを使う場合は、production-rollback environment にも
-接続用 Secrets を設定し、PROD_HOST_FINGERPRINT にホスト鍵指紋を登録します。
-サーバーのコンソールで次を実行し、SHA256:... の列を使用してください:
-  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
+同じ4種類のSecretsを登録し、Required reviewersを構成してください。
 
 秘密鍵ファイルはサーバー上に ${DEPLOY_BOT_KEY} として保存されています
 （権限 0600・root 読み取り専用）。
@@ -1241,7 +1244,11 @@ cat > /dev/tty <<'DONE'
    3) ssh work@<IP> が公開鍵で成功し、root SSH は拒否されること
       （google-authenticator 登録済みの場合のみ TOTP コードも必要）
    4) 自動デプロイ用に production environment へ
-      PROD_SSH_KEY / PROD_HOST / PROD_USER を登録
+      PROD_SSH_KEY / PROD_HOST / PROD_USER / PROD_HOST_FINGERPRINT を登録
+      指紋は信頼できるVPS管理コンソールで次を実行し SHA256:... の列を取得:
+      ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub -E sha256
+      標準構成はECDSAを使用。ホスト鍵構成を変えた場合はREADMEの手順を参照。
+      （ロールバック用 production-rollback にも同じ4種類を登録）
       （main への push と手動起動で deploy-production が実行されます）
    5) 初回管理者ユーザーを作成する（手順書 §10）:
       cd /opt/bat-app
