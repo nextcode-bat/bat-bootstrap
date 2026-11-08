@@ -43,6 +43,13 @@ warn()  { printf '%s[WARN]%s %s\n'  "$C_WARN" "$C_RESET" "$*"; }
 err()   { printf '%s[FAIL]%s %s\n'  "$C_ERR"  "$C_RESET" "$*" >&2; }
 die()   { err "$*"; exit 1; }
 
+# 大量の履歴は明示された環境だけに投入する。通常の構築ではマスタだけを初期化する。
+case "${BAT_SEED_MARKET_HISTORY:-0}" in
+  0) BAT_SEED_MARKET_HISTORY_BOOL=false ;;
+  1) BAT_SEED_MARKET_HISTORY_BOOL=true ;;
+  *) die "BAT_SEED_MARKET_HISTORY は 0 または 1 を指定してください" ;;
+esac
+
 # ------------------------------------------------------------
 # 対話入力ヘルパ（手順書 §5 注記: read は必ず /dev/tty から読む）
 #   ask        … 既定値つき通常入力（空入力で既定採用）
@@ -782,6 +789,7 @@ cat > "$VARS_FILE" <<VARS
 # bootstrap.sh が対話入力から生成（手順書 付録B 対話入力→設定マッピング）。
 # 機密値は含めない（機密は secrets.env 参照）。
 deploy_env: "${DEPLOY_ENV}"
+bat_seed_market_history: ${BAT_SEED_MARKET_HISTORY_BOOL}
 server_name: "${SERVER_NAME}"
 le_email: "${LE_EMAIL}"
 work_user: "${WORK_USER}"

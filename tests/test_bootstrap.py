@@ -16,6 +16,16 @@ def function(name):
 
 
 class BootstrapTest(unittest.TestCase):
+    def test_market_history_is_opt_in_and_rejects_other_values(self):
+        start = SCRIPT.index('case "${BAT_SEED_MARKET_HISTORY:-0}" in')
+        end = SCRIPT.index('\nesac', start) + len('\nesac')
+        block = SCRIPT[start:end] + '\nprintf "%s" "$BAT_SEED_MARKET_HISTORY_BOOL"'
+        for value, expected in [('', 'false'), ('0', 'false'), ('1', 'true')]:
+            result = self.run_shell('BAT_SEED_MARKET_HISTORY="$1"\n' + block, value)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, expected)
+        self.assertNotEqual(self.run_shell('BAT_SEED_MARKET_HISTORY="$1"\n' + block, 'yes').returncode, 0)
+
     def run_shell(self, body, *args, helpers=()):
         source = 'set -euo pipefail\n'
         source += 'log() { :; }; ok() { :; }; warn() { :; }; die() { exit 1; };\n'
