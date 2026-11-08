@@ -62,6 +62,31 @@ sudo docker compose --env-file .env.production -f docker-compose.production.yml 
 作成直後は 2FA 未設定（`totp_enabled_at = null`）。
 ブラウザで `https://<SERVER_NAME>/login` にユーザー名・パスワードでログインすると、`EnsureTwoFactorEnabled` ミドルウェアにより `/2fa/setup` へ自動誘導され、TOTP 登録とリカバリコード発行を行う。
 
+## 過去市場データの任意導入
+
+過去シミュレーション用の価格・制度費用資料は非公開のアプリリポジトリに同梱する。
+通常の構築・デプロイでは大量の履歴を投入しない。
+構築と同時に導入する場合は、手順3を次のように実行する。
+
+```bash
+sudo env BAT_SEED_MARKET_HISTORY=1 bash bootstrap.sh
+```
+
+構築後にも任意で実行できる。
+既存価格を上書きせず不足分だけ追加し、再実行で重複しない。
+
+```bash
+cd /opt/bat-app
+# 書き込まずにデータの整合性と追加予定件数を確認
+sudo docker compose --env-file .env.production -f docker-compose.production.yml exec -T app php artisan bat:market-history:seed --dry-run
+# 同梱資料を導入
+sudo docker compose --env-file .env.production -f docker-compose.production.yml exec -T app php artisan db:seed --class=MarketHistorySeeder --force
+```
+
+対象ペア・期間の指定はアプリの `docs/MARKET_HISTORY.md` を参照する。
+当時の受信履歴がない資料には利用可能時刻の仮定があり、実運用と同じ利益を保証しない。
+制度費用の同梱資料は過去再生専用で、本番自動取引の公表情報には使用しない。
+
 ## SSH の認証
 
 `work` への SSH ログインは公開鍵を必須とし、パスワード認証は禁止する。
